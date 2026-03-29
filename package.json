@@ -19,7 +19,7 @@
 		"format:check": "prettier --check .",
 		"check": "pnpm run format:check && vp check --no-fmt",
 		"check:fix": "pnpm run format && vp check --fix --no-fmt",
-		"test": "node --test tests/proxy.test.ts"
+		"test": "node --test --test-concurrency=1 tests/proxy.test.ts"
 	},
 	"dependencies": {
 		"@modelcontextprotocol/sdk": "^1.28.0",

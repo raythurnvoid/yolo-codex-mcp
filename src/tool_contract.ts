@@ -22,10 +22,12 @@ const codexOutputSchema: JsonObjectSchema = {
 export type OuterCodexCall = {
 	agentInstructions: string | null;
 	compactPrompt: string | null;
+	cwd: string | null;
 	prompt: string;
 };
 
 export type OuterCodexReplyCall = {
+	cwd: string | null;
 	prompt: string;
 	threadId: string;
 };
@@ -52,6 +54,10 @@ export function createReducedToolsListResult(): ListToolsResult {
 							type: "string",
 							description: "Optional prompt override used when Codex compacts the conversation.",
 						},
+						cwd: {
+							type: "string",
+							description: "Optional working directory forwarded to Codex for this call.",
+						},
 					},
 					required: ["prompt"],
 				},
@@ -72,6 +78,10 @@ export function createReducedToolsListResult(): ListToolsResult {
 							type: "string",
 							description: "The next user prompt to continue the Codex conversation.",
 						},
+						cwd: {
+							type: "string",
+							description: "Optional working directory forwarded to Codex for this call.",
+						},
 					},
 					required: ["threadId", "prompt"],
 				},
@@ -88,6 +98,7 @@ export function parseOuterCodexCall(argumentsValue: unknown): OuterCodexCall {
 		prompt,
 		agentInstructions: readOptionalString(args["agent-instructions"]),
 		compactPrompt: readOptionalString(args["compact-prompt"]),
+		cwd: readOptionalString(args.cwd),
 	};
 }
 
@@ -102,6 +113,7 @@ export function parseOuterCodexReplyCall(argumentsValue: unknown): OuterCodexRep
 	return {
 		threadId,
 		prompt,
+		cwd: readOptionalString(args.cwd),
 	};
 }
 
@@ -118,7 +130,9 @@ export function buildInnerCodexArguments(call: OuterCodexCall, policy: ProxyPoli
 	if (policy.profile !== null) {
 		forwarded.profile = policy.profile;
 	}
-	if (policy.cwd !== null) {
+	if (call.cwd !== null) {
+		forwarded.cwd = call.cwd;
+	} else if (policy.cwd !== null) {
 		forwarded.cwd = policy.cwd;
 	}
 	if (call.agentInstructions !== null) {
@@ -131,11 +145,19 @@ export function buildInnerCodexArguments(call: OuterCodexCall, policy: ProxyPoli
 	return forwarded;
 }
 
-export function buildInnerCodexReplyArguments(call: OuterCodexReplyCall) {
-	return {
+export function buildInnerCodexReplyArguments(call: OuterCodexReplyCall, policy: ProxyPolicy) {
+	const forwarded: Record<string, unknown> = {
 		threadId: call.threadId,
 		prompt: call.prompt,
 	};
+
+	if (call.cwd !== null) {
+		forwarded.cwd = call.cwd;
+	} else if (policy.cwd !== null) {
+		forwarded.cwd = policy.cwd;
+	}
+
+	return forwarded;
 }
 
 export function createToolCallErrorResult(message: string) {

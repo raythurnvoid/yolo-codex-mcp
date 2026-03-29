@@ -1,5 +1,6 @@
-import { appendFile } from "node:fs/promises";
-import { createInterface } from "node:readline";
+import { appendFile, mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import path from "node:path";
 
 type JsonRpcId = number | string | null;
 
@@ -26,16 +27,27 @@ type JsonRpcMessage = JsonRpcNotification | JsonRpcRequest | JsonRpcResponse;
 
 const capturePath = process.env.MOCK_INNER_CAPTURE;
 const output = process.stdout;
-const input = createInterface({
-	input: process.stdin,
-	crlfDelay: Number.POSITIVE_INFINITY,
-});
+let buffered = "";
+setInterval(() => {}, 1_000_000);
 
 let pendingApprovalRequestId: JsonRpcId | null = null;
 let pendingCallId: JsonRpcId | null = null;
+let pendingRootsRequestId: JsonRpcId | null = null;
+let pendingRootsCallId: JsonRpcId | null = null;
 
-input.on("line", (line) => {
-	void handleLine(line);
+process.stdin.on("data", (chunk: Buffer | string) => {
+	buffered += String(chunk);
+
+	for (;;) {
+		const newlineIndex = buffered.indexOf("\n");
+		if (newlineIndex < 0) {
+			return;
+		}
+
+		const line = buffered.slice(0, newlineIndex).replace(/\r$/, "");
+		buffered = buffered.slice(newlineIndex + 1);
+		void handleLine(line);
+	}
 });
 
 async function handleLine(line: string): Promise<void> {
@@ -117,6 +129,70 @@ async function onRequest(message: JsonRpcRequest): Promise<void> {
 			return;
 		}
 
+		if (prompt === "needs-roots") {
+			pendingRootsRequestId = 1;
+			pendingRootsCallId = message.id;
+			await write({
+				jsonrpc: "2.0",
+				id: pendingRootsRequestId,
+				method: "roots/list",
+				params: {},
+			});
+			return;
+		}
+
+		if (
+			prompt === "stuck-rollout" ||
+			prompt === "stuck-rollout-delayed-response" ||
+			prompt === "stuck-rollout-session-scan"
+		) {
+			const threadId =
+				toolName === "codex-reply" && typeof argumentsObject.threadId === "string"
+					? argumentsObject.threadId
+					: prompt === "stuck-rollout-session-scan"
+						? "thr_session_scan"
+						: "thr_stuck_rollout";
+			const rolloutPath = await createMockRolloutFile(threadId, prompt === "stuck-rollout-session-scan");
+			await write({
+				jsonrpc: "2.0",
+				method: "codex/event",
+				params: {
+					_meta: {
+						requestId: message.id,
+						threadId,
+					},
+					id: "evt-rollout",
+					msg: {
+						type: "session_configured",
+						session_id: threadId,
+						...(prompt === "stuck-rollout-session-scan" ? {} : { rollout_path: rolloutPath }),
+					},
+				},
+			});
+			setTimeout(() => {
+				void appendTaskCompleteEvent(
+					rolloutPath,
+					message.id,
+					threadId,
+					prompt === "stuck-rollout-delayed-response"
+						? "delayed rollout ok"
+						: prompt === "stuck-rollout-session-scan"
+							? "session scan ok"
+							: "rollout ok",
+				);
+			}, 100);
+			if (prompt === "stuck-rollout-delayed-response") {
+				setTimeout(() => {
+					void write({
+						jsonrpc: "2.0",
+						id: message.id,
+						result: createToolResult(threadId, "delayed real ok"),
+					});
+				}, 6_000);
+			}
+			return;
+		}
+
 		const threadId =
 			toolName === "codex-reply" && typeof argumentsObject.threadId === "string"
 				? argumentsObject.threadId
@@ -156,6 +232,32 @@ async function onRequest(message: JsonRpcRequest): Promise<void> {
 }
 
 async function onResponse(message: JsonRpcResponse): Promise<void> {
+	if (pendingRootsRequestId !== null && message.id === pendingRootsRequestId && pendingRootsCallId !== null) {
+		const roots =
+			typeof message.result === "object" && message.result !== null && "roots" in message.result
+				? (message.result as { roots?: unknown }).roots
+				: [];
+		await write({
+			jsonrpc: "2.0",
+			id: pendingRootsCallId,
+			result: {
+				content: [
+					{
+						type: "text",
+						text: "roots ok",
+					},
+				],
+				structuredContent: {
+					threadId: "thr_roots",
+					content: JSON.stringify(roots),
+				},
+			},
+		});
+		pendingRootsRequestId = null;
+		pendingRootsCallId = null;
+		return;
+	}
+
 	if (pendingApprovalRequestId === null || message.id !== pendingApprovalRequestId || pendingCallId === null) {
 		return;
 	}
@@ -189,4 +291,64 @@ async function record(message: JsonRpcMessage): Promise<void> {
 
 async function write(message: JsonRpcMessage): Promise<void> {
 	output.write(`${JSON.stringify(message)}\n`);
+}
+
+function createToolResult(threadId: string, text: string) {
+	return {
+		content: [
+			{
+				type: "text",
+				text,
+			},
+		],
+		structuredContent: {
+			threadId,
+			content: text,
+		},
+	};
+}
+
+async function createMockRolloutFile(threadId: string, useSessionsRoot: boolean): Promise<string> {
+	const rolloutDirectory = useSessionsRoot
+		? path.join(getNativeSessionsRoot(), "2026", "03", "29")
+		: await mkdtemp(path.join(tmpdir(), "yolo-codex-rollout-"));
+	await mkdir(rolloutDirectory, { recursive: true });
+	const rolloutPath = path.join(rolloutDirectory, `rollout-2026-03-29T10-00-00-${threadId}.jsonl`);
+	await writeFile(rolloutPath, "", "utf8");
+	return rolloutPath;
+}
+
+async function appendTaskCompleteEvent(
+	rolloutPath: string,
+	requestId: JsonRpcId,
+	threadId: string,
+	lastAgentMessage: string,
+): Promise<void> {
+	await appendFile(
+		rolloutPath,
+		`${JSON.stringify({
+			ts: new Date().toISOString(),
+			dir: "to_tui",
+			kind: "codex_event",
+			payload: {
+				_meta: {
+					requestId,
+					threadId,
+				},
+				id: "evt-task-complete",
+				msg: {
+					type: "task_complete",
+					last_agent_message: lastAgentMessage,
+				},
+			},
+		})}\n`,
+		"utf8",
+	);
+}
+
+function getNativeSessionsRoot(): string {
+	if (process.platform === "win32") {
+		return path.win32.join(process.env.USERPROFILE ?? homedir(), ".codex", "sessions");
+	}
+	return path.posix.join(process.env.HOME ?? homedir(), ".codex", "sessions");
 }
