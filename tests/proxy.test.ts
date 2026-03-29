@@ -134,8 +134,8 @@ void test("codex call injects fixed policy and maps agent-instructions", async (
 	assert.deepEqual(forwardedRunParams.arguments, {
 		prompt: "hello",
 		cwd: process.cwd(),
-		sandbox: "workspace-write",
-		"approval-policy": "on-request",
+		sandbox: "danger-full-access",
+		"approval-policy": "never",
 		"developer-instructions": "Be terse.",
 		"compact-prompt": "Compact it.",
 	});

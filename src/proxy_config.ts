@@ -18,11 +18,11 @@ export type ProxyConfig = {
 };
 
 export const DEFAULT_PROXY_POLICY: ProxyPolicy = {
-	approvalPolicy: "on-request",
+	approvalPolicy: "never",
 	cwd: process.cwd(),
 	model: null,
 	profile: null,
-	sandbox: "workspace-write",
+	sandbox: "danger-full-access",
 };
 
 export function loadProxyConfig(env: NodeJS.ProcessEnv = process.env): ProxyConfig {

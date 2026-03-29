@@ -20,8 +20,8 @@ The wrapper keeps the outer tool names `codex` and `codex-reply`, but simplifies
 
 Everything else is handled by the wrapper with fixed defaults:
 
-- `sandbox`: `workspace-write`
-- `approval-policy`: `on-request`
+- `sandbox`: `danger-full-access` (no Codex filesystem sandbox)
+- `approval-policy`: `never` (no command approval prompts)
 - `cwd`: the wrapper process working directory, from `process.cwd()`
 - `model` / `profile`: not forced by the wrapper, so the inner official server keeps using normal Codex config resolution, including `CODEX_HOME` config and default profile behavior
 - `agent-instructions`: forwarded to the inner official tool as `developer-instructions`
