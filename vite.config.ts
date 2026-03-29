@@ -1,12 +1,6 @@
 import { defineConfig } from "vite-plus";
 
 export default defineConfig({
-	fmt: {
-		ignorePatterns: ["dist/**", "reference-submodules/**"],
-		useTabs: true,
-		singleQuote: false,
-		printWidth: 120,
-	},
 	lint: {
 		ignorePatterns: ["dist/**", "reference-submodules/**"],
 		options: {

@@ -15,7 +15,10 @@
 		"start": "node src/server.ts",
 		"dev": "node --watch src/server.ts",
 		"start:dist": "node dist/server.mjs",
-		"check": "vp check",
+		"format": "prettier --write .",
+		"format:check": "prettier --check .",
+		"check": "pnpm run format:check && vp check --no-fmt",
+		"check:fix": "pnpm run format && vp check --fix --no-fmt",
 		"test": "node --test tests/proxy.test.ts"
 	},
 	"dependencies": {
@@ -24,6 +27,7 @@
 	},
 	"devDependencies": {
 		"@types/node": "^25.5.0",
+		"prettier": "^3.8.1",
 		"typescript": "^5.9.3",
 		"vite-plus": "^0.1.14"
 	},

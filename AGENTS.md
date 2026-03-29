@@ -149,6 +149,7 @@ This project is often used on Windows and must not regress there.
 - Preserve the distinction between launching a Windows binary directly and launching a WSL binary through `wsl.exe`
 - Preserve `.cmd` / `.bat` wrapping through `cmd.exe` when launching the inner server on Windows
 - Remember that Cursor and other GUI-launched MCP hosts may have a thinner PATH than the user’s terminal, so docs and errors should describe `CODEX_MCP_BIN` as a fallback after auto-discovery fails, not as the primary setup
+- When the user asks to **find Codex CLI session history** (rollouts, transcripts, `rollout-*.jsonl`, or “the sessions folder”), **read the maintainer’s Cursor skill `run-codex-windows`** (`run-codex` / `run-codex-windows` in `.cursor/skills/`) **before** searching disk. For Codex **CLI** runs from WSL, rollouts live under **WSL `~/.codex/sessions`**, which is **not** the same tree as Windows `%USERPROFILE%\.codex\sessions`; do not infer that no sessions exist from an empty Windows-only folder.
 
 If you change launch logic, validate the affected paths and explain what cases were verified.
 

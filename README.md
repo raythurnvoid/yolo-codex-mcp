@@ -22,7 +22,7 @@ Everything else is handled by the wrapper with fixed defaults:
 
 - `sandbox`: `danger-full-access` (no Codex filesystem sandbox)
 - `approval-policy`: `never` (no command approval prompts)
-- `cwd`: the wrapper process working directory, from `process.cwd()`
+- `cwd`: `CODEX_MCP_CWD` when set to a non-empty value, otherwise the wrapper process working directory from `process.cwd()`
 - `model` / `profile`: not forced by the wrapper, so the inner official server keeps using normal Codex config resolution, including `CODEX_HOME` config and default profile behavior
 - `agent-instructions`: forwarded to the inner official tool as `developer-instructions`
 - inner Codex binary resolution: override env first, then normal PATH lookup, then common Windows install locations and user shims, then WSL on Windows when available
@@ -96,19 +96,25 @@ pnpm test
 Run formatting, lint, and type checks:
 
 ```bash
-vp check
+pnpm run check
 ```
 
 Auto-fix formatting and lint issues where possible:
 
 ```bash
-vp check --fix
+pnpm run check:fix
+```
+
+Format the repo with Prettier:
+
+```bash
+pnpm run format
 ```
 
 Format a specific path:
 
 ```bash
-vp fmt <path>
+pnpm exec prettier --write <path>
 ```
 
 ## MCP Configuration
@@ -130,7 +136,21 @@ That single MCP config entry is enough. No `cwd`, no `env`, and no `CODEX_MCP_BI
 
 When you adapt this for your own machine, replace the path with your own `<path-to-repo>/src/server.ts`.
 
-The wrapper forwards its own `process.cwd()` as the inner Codex `cwd`. In Cursor, that means the working directory comes from how Cursor launches the MCP process. If you need to force a different directory, add `cwd` explicitly as an override, but that is not the normal setup.
+By default, the wrapper forwards its own `process.cwd()` as the inner Codex `cwd`. If `CODEX_MCP_CWD` is set to a non-empty value, the wrapper forwards that instead. In Cursor, the recommended way to pin the workspace directory is an `env` override:
+
+```json
+{
+	"mcpServers": {
+		"codex-yolo": {
+			"command": "node",
+			"args": ["<path-to-repo>/src/server.ts"],
+			"env": {
+				"CODEX_MCP_CWD": "${workspaceFolder}"
+			}
+		}
+	}
+}
+```
 
 If automatic discovery still misses an unusual Codex install, add an `env` block as a fallback:
 
@@ -190,10 +210,12 @@ Tradeoff:
 
 ## Environment
 
-The wrapper only supports inner-launch overrides:
+The wrapper supports these environment overrides:
 
 - `CODEX_MCP_BIN`: optional override for the inner Codex command. Default behavior is automatic discovery.
 - `CODEX_MCP_ARGS`: override inner startup args as a JSON array of strings. Default: `["mcp-server"]`
+- `CODEX_MCP_CWD`: optional override for the inner Codex working directory. If unset or blank, the wrapper uses `process.cwd()`
+- `CODEX_MCP_DEBUG_INBOUND`: optional diagnostic flag. Set to `1`, `true`, `yes`, or `on` to log selected outer client -> proxy JSON-RPC traffic to `stderr`
 
 Compatibility note:
 
@@ -206,7 +228,7 @@ Examples:
 - extensionless Windows path override: `CODEX_MCP_BIN=C:\\Users\\<you>\\bin\\codex` and the wrapper will probe `codex.exe`, `codex.cmd`, then `codex.bat`
 - WSL launch: `CODEX_MCP_BIN=wsl.exe` and `CODEX_MCP_ARGS=["-e","codex","mcp-server"]`
 
-There are no extra wrapper-specific policy env vars.
+There are no extra wrapper-specific policy env vars. `CODEX_MCP_DEBUG_INBOUND` is diagnostic-only and does not change proxy behavior.
 
 ## Tool Behavior
 
@@ -223,7 +245,7 @@ Forwarded to the inner official tool:
 - `prompt` -> `prompt`
 - `agent-instructions` -> `developer-instructions`
 - `compact-prompt` -> `compact-prompt`
-- wrapper also injects fixed `sandbox`, `approval-policy`, and `cwd`
+- wrapper also injects fixed `sandbox` and `approval-policy`, plus `cwd` resolved from `CODEX_MCP_CWD` or `process.cwd()`
 
 ### `codex-reply`
 
@@ -244,7 +266,20 @@ If the wrapper cannot start the inner server, it has already tried automatic dis
 
 ### Wrong Working Directory
 
-The wrapper does not auto-read Cursor `workspace_roots` or MCP roots and map them to `cwd`. By default it uses the wrapper process `cwd` from `process.cwd()`. If Cursor is launching the server from the wrong place for your workflow, add a `cwd` override in `mcp.json`.
+The wrapper does not auto-read Cursor `workspace_roots` or MCP roots and map them to `cwd`. By default it uses the wrapper process `cwd` from `process.cwd()`. If you need to force a specific workspace, set `CODEX_MCP_CWD` in the MCP server `env` block, for example `"CODEX_MCP_CWD": "${workspaceFolder}"` in Cursor.
+
+### Debug Inbound MCP Handshake
+
+To inspect what Cursor is actually sending to the wrapper, set `CODEX_MCP_DEBUG_INBOUND=1` in the MCP server `env` block. The wrapper then writes grep-friendly `stderr` lines prefixed with `[yolo-codex-mcp][mcp-in]` for:
+
+- `initialize` requests, including summarized `params`
+- `notifications/initialized`
+- `roots/*`
+- `workspace/*`
+- `$/...` notifications or requests
+- client responses to server-initiated `roots/*`, `workspace/*`, or `$/...` requests
+
+This is intended to answer whether the MCP client supplied workspace roots or similar path context over the wire. Tool calls are not logged by this diagnostic path.
 
 ### Smoke Test Is Skipped
 

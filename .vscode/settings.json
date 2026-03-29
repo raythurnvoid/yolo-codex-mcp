@@ -1,18 +1,21 @@
 {
-	"editor.defaultFormatter": "oxc.oxc-vscode",
+	"editor.detectIndentation": false,
+	"editor.defaultFormatter": "esbenp.prettier-vscode",
 	"editor.formatOnSave": true,
 	"editor.formatOnSaveMode": "file",
 	"editor.insertSpaces": false,
-	"editor.codeActionsOnSave": {
-		"source.fixAll.oxc": "explicit"
-	},
+	"editor.tabSize": 2,
 	"files.eol": "\n",
 	"files.watcherExclude": {
 		"**/.git/objects/**": true,
 		"**/.git/subtree-cache/**": true,
 		"**/.hg/store/**": true
 	},
-	"oxc.fmt.configPath": "./vite.config.ts",
-	"oxc.enable.oxfmt": true,
-	"oxc.enable.oxlint": true
+	"prettier.prettierPath": "node_modules/prettier/index.cjs",
+	"prettier.printWidth": 120,
+	"prettier.tabWidth": 2,
+	"prettier.useTabs": true,
+	"prettier.arrowParens": "always",
+	"prettier.endOfLine": "lf",
+	"prettier.proseWrap": "preserve"
 }
