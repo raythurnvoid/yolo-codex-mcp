@@ -1,0 +1,18 @@
+{
+	"editor.defaultFormatter": "oxc.oxc-vscode",
+	"editor.formatOnSave": true,
+	"editor.formatOnSaveMode": "file",
+	"editor.insertSpaces": false,
+	"editor.codeActionsOnSave": {
+		"source.fixAll.oxc": "explicit"
+	},
+	"files.eol": "\n",
+	"files.watcherExclude": {
+		"**/.git/objects/**": true,
+		"**/.git/subtree-cache/**": true,
+		"**/.hg/store/**": true
+	},
+	"oxc.fmt.configPath": "./vite.config.ts",
+	"oxc.enable.oxfmt": true,
+	"oxc.enable.oxlint": true
+}

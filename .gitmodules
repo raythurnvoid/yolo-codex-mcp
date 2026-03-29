@@ -1,0 +1,6 @@
+[submodule "reference-submodules/codex"]
+	path = reference-submodules/codex
+	url = https://github.com/openai/codex.git
+[submodule "reference-submodules/typescript-sdk"]
+	path = reference-submodules/typescript-sdk
+	url = https://github.com/modelcontextprotocol/typescript-sdk.git

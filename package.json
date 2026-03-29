@@ -1,0 +1,31 @@
+{
+	"name": "yolo-codex-mcp",
+	"version": "0.0.0",
+	"description": "Custom stdio MCP server that exposes Codex CLI tools for host-driven execution.",
+	"keywords": [],
+	"license": "ISC",
+	"author": "",
+	"bin": {
+		"yolo-codex-mcp": "./dist/server.mjs"
+	},
+	"type": "module",
+	"main": "dist/server.mjs",
+	"scripts": {
+		"build": "vp pack",
+		"start": "node src/server.ts",
+		"dev": "node --watch src/server.ts",
+		"start:dist": "node dist/server.mjs",
+		"check": "vp check",
+		"test": "node --test tests/proxy.test.ts"
+	},
+	"dependencies": {
+		"@modelcontextprotocol/sdk": "^1.28.0",
+		"zod": "^4.3.6"
+	},
+	"devDependencies": {
+		"@types/node": "^25.5.0",
+		"typescript": "^5.9.3",
+		"vite-plus": "^0.1.14"
+	},
+	"packageManager": "pnpm@10.28.0"
+}
