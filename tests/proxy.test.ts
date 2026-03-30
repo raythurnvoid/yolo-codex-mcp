@@ -74,6 +74,35 @@ afterEach(async () => {
 	);
 });
 
+/**
+ * Creates a tool result object that includes the thread id and content.
+ * 
+ * @param threadId - The thread id to include in the tool result.
+ * @param text - The content to include in the tool result.
+ * @param options - Optional parameters to control the tool result.
+ * @returns A tool result object.
+ */
+function createExpectedToolResult(threadId: string, text: string, options: { isError?: boolean } = {}) {
+	return {
+		content: [
+			{
+				type: "text",
+				text,
+			},
+			{
+				type: "text",
+				text: `threadId: ${threadId}`,
+			},
+		],
+		...(options.isError ? { isError: true } : {}),
+		structuredContent: {
+			threadId,
+			thread_id: threadId,
+			content: text,
+		},
+	};
+}
+
 void test("tools/list exposes only the reduced outer schemas", async () => {
 	const server = await createProxyHarness();
 	await server.initialize();
@@ -113,7 +142,7 @@ void test("tools/list exposes only the reduced outer schemas", async () => {
 	assert.match(result.tools[0].description, /usually cheaper and more cost-efficient/);
 	assert.match(
 		result.tools[0].description,
-		/human-readable answer in content\/text plus structuredContent with threadId and content/,
+		/human-readable answer in content\/text, a trailing threadId text line, and structuredContent with threadId, thread_id, and content/,
 	);
 	assert.match(result.tools[0].description, /call agent-reply with the returned threadId from the prior response/);
 	assert.match(
@@ -188,6 +217,8 @@ void test("resources/read returns usage and rollout guidance", async () => {
 	).contents[0]?.text;
 
 	assert.match(guideText ?? "", /structuredContent\.threadId/);
+	assert.match(guideText ?? "", /structuredContent\.thread_id/);
+	assert.match(guideText ?? "", /threadId: <id>/);
 	assert.match(guideText ?? "", /Smart Cheap Agent/);
 	assert.match(guideText ?? "", /agent-reply/);
 	assert.match(guideText ?? "", /Legacy aliases `codex` and `codex-reply` are still accepted/);
@@ -215,16 +246,7 @@ void test("agent-start call injects fixed policy and maps agent-instructions", a
 
 	assert.equal(notification.method, "codex/event");
 	assert.deepEqual(response.result, {
-		content: [
-			{
-				type: "text",
-				text: "run ok",
-			},
-		],
-		structuredContent: {
-			threadId: "thr_mock",
-			content: "run ok",
-		},
+		...createExpectedToolResult("thr_mock", "run ok"),
 	});
 
 	const forwardedCall = await server.findCapturedRequest("tools/call", "codex");
@@ -239,6 +261,20 @@ void test("agent-start call injects fixed policy and maps agent-instructions", a
 		"developer-instructions": "Be terse.",
 		"compact-prompt": "Compact it.",
 	});
+});
+
+void test("agent-start backfills thread context into the result without a Cursor hook", async () => {
+	const server = await createProxyHarness();
+	await server.initialize();
+
+	const response = await server.request("tools/call", {
+		name: "agent-start",
+		arguments: {
+			prompt: "thread-context-from-event-only",
+		},
+	});
+
+	assert.deepEqual(response.result, createExpectedToolResult("thr_event_only", "event only ok"));
 });
 
 void test("agent-start call defaults cwd to the wrapper process cwd", async () => {
@@ -402,16 +438,7 @@ void test("agent-reply forwards threadId and supports deprecated conversationId 
 	});
 
 	assert.deepEqual(response.result, {
-		content: [
-			{
-				type: "text",
-				text: "reply ok",
-			},
-		],
-		structuredContent: {
-			threadId: "thr_from_conversation",
-			content: "reply ok",
-		},
+		...createExpectedToolResult("thr_from_conversation", "reply ok"),
 	});
 
 	const forwardedCall = await server.findCapturedRequest("tools/call", "codex-reply");
@@ -471,16 +498,7 @@ void test("legacy codex and codex-reply aliases still dispatch through the reduc
 		},
 	});
 	assert.deepEqual(startResponse.result, {
-		content: [
-			{
-				type: "text",
-				text: "run ok",
-			},
-		],
-		structuredContent: {
-			threadId: "thr_mock",
-			content: "run ok",
-		},
+		...createExpectedToolResult("thr_mock", "run ok"),
 	});
 
 	const replyResponse = await server.request("tools/call", {
@@ -491,16 +509,7 @@ void test("legacy codex and codex-reply aliases still dispatch through the reduc
 		},
 	});
 	assert.deepEqual(replyResponse.result, {
-		content: [
-			{
-				type: "text",
-				text: "reply ok",
-			},
-		],
-		structuredContent: {
-			threadId: "thr_legacy",
-			content: "reply ok",
-		},
+		...createExpectedToolResult("thr_legacy", "reply ok"),
 	});
 });
 
@@ -516,16 +525,7 @@ void test("rollout polling synthesizes completion when the inner response never 
 	});
 
 	assert.deepEqual(response.result, {
-		content: [
-			{
-				type: "text",
-				text: "rollout ok",
-			},
-		],
-		structuredContent: {
-			threadId: "thr_stuck_rollout",
-			content: "rollout ok",
-		},
+		...createExpectedToolResult("thr_stuck_rollout", "rollout ok"),
 	});
 
 	const stderr = await server.waitForStderr("Synthesized agent-start completion from rollout polling");
@@ -545,18 +545,11 @@ void test("live turn_aborted events synthesize interrupted error results and sup
 	});
 
 	assert.deepEqual(response.result, {
-		content: [
-			{
-				type: "text",
-				text: "Smart Cheap Agent run was interrupted before the inner MCP returned a final tool result (reason: interrupted).",
-			},
-		],
-		isError: true,
-		structuredContent: {
-			threadId: "thr_turn_aborted_live",
-			content:
-				"Smart Cheap Agent run was interrupted before the inner MCP returned a final tool result (reason: interrupted).",
-		},
+		...createExpectedToolResult(
+			"thr_turn_aborted_live",
+			"Smart Cheap Agent run was interrupted before the inner MCP returned a final tool result (reason: interrupted).",
+			{ isError: true },
+		),
 	});
 
 	const stderr = await server.waitForStderr("Suppressed late inner response after synthetic interruption completion");
@@ -587,18 +580,11 @@ void test("rollout polling synthesizes interrupted error results when the rollou
 	});
 
 	assert.deepEqual(response.result, {
-		content: [
-			{
-				type: "text",
-				text: "Smart Cheap Agent run was interrupted before the inner MCP returned a final tool result (reason: interrupted).",
-			},
-		],
-		isError: true,
-		structuredContent: {
-			threadId: "thr_rollout_aborted",
-			content:
-				"Smart Cheap Agent run was interrupted before the inner MCP returned a final tool result (reason: interrupted).",
-		},
+		...createExpectedToolResult(
+			"thr_rollout_aborted",
+			"Smart Cheap Agent run was interrupted before the inner MCP returned a final tool result (reason: interrupted).",
+			{ isError: true },
+		),
 	});
 
 	const stderr = await server.waitForStderr("Synthesized agent-start interruption result from rollout polling");
@@ -631,16 +617,7 @@ void test("rollout polling falls back to the sessions folder when rollout_path i
 	});
 
 	assert.deepEqual(response.result, {
-		content: [
-			{
-				type: "text",
-				text: "session scan ok",
-			},
-		],
-		structuredContent: {
-			threadId: "thr_session_scan",
-			content: "session scan ok",
-		},
+		...createExpectedToolResult("thr_session_scan", "session scan ok"),
 	});
 
 	const stderr = await server.waitForStderr("sessions scan");
@@ -663,16 +640,7 @@ void test("late inner responses are suppressed after synthetic rollout completio
 	});
 
 	assert.deepEqual(response.result, {
-		content: [
-			{
-				type: "text",
-				text: "delayed rollout ok",
-			},
-		],
-		structuredContent: {
-			threadId: "thr_stuck_rollout",
-			content: "delayed rollout ok",
-		},
+		...createExpectedToolResult("thr_stuck_rollout", "delayed rollout ok"),
 	});
 	await server.assertNoAdditionalResponse(response.id, 2_500);
 });
@@ -753,16 +721,7 @@ void test("server-initiated elicitation requests are remapped back to the inner 
 
 	const response = await responsePromise;
 	assert.deepEqual(response.result, {
-		content: [
-			{
-				type: "text",
-				text: "approval ok",
-			},
-		],
-		structuredContent: {
-			threadId: "thr_approval",
-			content: "approval ok",
-		},
+		...createExpectedToolResult("thr_approval", "approval ok"),
 	});
 
 	const forwardedResponse = await server.findCapturedResponse(0);

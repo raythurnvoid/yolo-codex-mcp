@@ -233,6 +233,38 @@ async function onRequest(message: JsonRpcRequest): Promise<void> {
 			return;
 		}
 
+		if (prompt === "thread-context-from-event-only") {
+			const threadId = "thr_event_only";
+			await write({
+				jsonrpc: "2.0",
+				method: "codex/event",
+				params: {
+					_meta: {
+						requestId: message.id,
+						threadId,
+					},
+					id: "evt-thread-context-only",
+					msg: {
+						type: "session_configured",
+						session_id: threadId,
+					},
+				},
+			});
+			await write({
+				jsonrpc: "2.0",
+				id: message.id,
+				result: {
+					content: [
+						{
+							type: "text",
+							text: "event only ok",
+						},
+					],
+				},
+			});
+			return;
+		}
+
 		const threadId =
 			toolName === "codex-reply" && typeof argumentsObject.threadId === "string"
 				? argumentsObject.threadId

@@ -60,6 +60,7 @@ type PendingToolCall = {
 	startedAtMs: number;
 	syntheticCompletionSent: boolean;
 	syntheticResultKind: "completion" | "interrupted" | null;
+	/** Session id for the in-flight agent tool call; used when normalizing the tool result for the outer MCP client. */
 	threadId: string | null;
 	toolName: OuterToolName;
 };
@@ -562,7 +563,10 @@ async function onInnerMessage(
 		}
 
 		const pendingToolCall = context.pendingToolCalls.get(jsonRpcIdKey(message.id));
+		let normalizedResponseMessage = message;
 		if (pendingToolCall) {
+			// Outer MCP clients (e.g. Cursor) only see this JSON-RPC response. For agent-start / agent-reply we enrich
+			// the inner tool result here so clients can read the Codex session id without a separate host hook.
 			if (pendingToolCall.syntheticCompletionSent) {
 				if (pendingToolCall.syntheticResultKind === "interrupted") {
 					process.stderr.write(
@@ -573,6 +577,12 @@ async function onInnerMessage(
 				}
 				finishPendingToolCall(pendingToolCall, context.pendingToolCalls);
 				return;
+			}
+			if (isJsonRpcResponse(message)) {
+				normalizedResponseMessage = {
+					...message,
+					result: normalizeToolCallResult(message.result, pendingToolCall),
+				};
 			}
 			finishPendingToolCall(pendingToolCall, context.pendingToolCalls);
 		}
@@ -585,7 +595,7 @@ async function onInnerMessage(
 			return;
 		}
 
-		await context.clientWriter.write(message);
+		await context.clientWriter.write(normalizedResponseMessage);
 	}
 }
 
@@ -1191,6 +1201,7 @@ async function observeCodexEvent(
 		return;
 	}
 
+	// Inner Codex emits thread id on codex/event before the tool call finishes; stash it for normalizeToolCallResult.
 	if (snapshot.threadId !== null) {
 		pendingToolCall.threadId = snapshot.threadId;
 	}
@@ -1530,40 +1541,131 @@ function parseRolloutTerminalLine(line: string | null): RolloutTerminalSnapshot 
 	};
 }
 
+/** Same thread-id surface as real inner completions so clients always get a consistent tool result shape. */
 function createSyntheticToolCallResult(threadId: string, content: string) {
-	return {
-		content: [
-			{
-				type: "text",
-				text: content,
+	return addThreadContextToToolResult(
+		{
+			content: [
+				{
+					type: "text",
+					text: content,
+				},
+			],
+			structuredContent: {
+				content,
 			},
-		],
-		structuredContent: {
-			threadId,
-			content,
 		},
-	};
+		threadId,
+	);
 }
 
 function createSyntheticInterruptedToolCallResult(threadId: string | null, reason: string | null) {
 	const content = createInterruptedToolCallMessage(reason);
-	return {
-		content: [
-			{
-				type: "text",
-				text: content,
+	if (threadId === null) {
+		return {
+			content: [
+				{
+					type: "text",
+					text: content,
+				},
+			],
+			isError: true,
+		};
+	}
+
+	return addThreadContextToToolResult(
+		{
+			content: [
+				{
+					type: "text",
+					text: content,
+				},
+			],
+			isError: true,
+			structuredContent: {
+				content,
 			},
-		],
-		isError: true,
-		...(threadId === null
-			? {}
-			: {
-					structuredContent: {
-						threadId,
-						content,
-					},
-				}),
+		},
+		threadId,
+	);
+}
+
+/**
+ * Ensures the tool result forwarded to the outer MCP client includes the Codex session thread id.
+ * Resolution order: id already present on the inner result, then pending state from codex/event / rollout filename.
+ * When no id can be found, the inner payload is passed through unchanged.
+ */
+function normalizeToolCallResult(result: unknown, pendingToolCall: PendingToolCall): unknown {
+	if (!isRecord(result)) {
+		return result;
+	}
+
+	const threadId =
+		readToolResultThreadId(result) ??
+		pendingToolCall.threadId ??
+		(pendingToolCall.rolloutPath === null ? null : inferThreadIdFromRolloutPath(pendingToolCall.rolloutPath));
+	if (threadId === null) {
+		return result;
+	}
+
+	pendingToolCall.threadId = threadId;
+	return addThreadContextToToolResult(result, threadId);
+}
+
+/** Reads thread id the inner server may already attach to the tool result (top-level or structuredContent). */
+function readToolResultThreadId(result: Record<string, unknown>): string | null {
+	return (
+		readOptionalRecordString(result, "threadId") ??
+		readOptionalRecordString(isRecord(result.structuredContent) ? result.structuredContent : null, "threadId") ??
+		readOptionalRecordString(isRecord(result.structuredContent) ? result.structuredContent : null, "thread_id")
+	);
+}
+
+/**
+ * Mutates the CallToolResult-shaped object so MCP clients can discover the session id:
+ * - Appends a final `content` text item: `threadId: <uuid>` (human-visible in UIs that show tool output).
+ * - Sets `structuredContent.threadId` and `structuredContent.thread_id` (machine-readable; some clients prefer one key).
+ * - Fills `structuredContent.content` when missing so structured output stays aligned with visible text.
+ */
+function addThreadContextToToolResult(result: Record<string, unknown>, threadId: string): Record<string, unknown> {
+	const threadIdLine = `threadId: ${threadId}`;
+	const content = Array.isArray(result.content) ? [...result.content] : [];
+	if (
+		!content.some(
+			(item) => isRecord(item) && item.type === "text" && typeof item.text === "string" && item.text === threadIdLine,
+		)
+	) {
+		content.push({
+			type: "text",
+			text: threadIdLine,
+		});
+	}
+
+	const existingStructuredContent = isRecord(result.structuredContent) ? result.structuredContent : {};
+	const structuredContentValue =
+		readOptionalRecordString(existingStructuredContent, "content") ?? readPrimaryToolResultText(content, threadIdLine);
+
+	return {
+		...result,
+		content: [...content],
+		structuredContent: {
+			...existingStructuredContent,
+			...(structuredContentValue === null ? {} : { content: structuredContentValue }),
+			threadId,
+			thread_id: threadId,
+		},
 	};
+}
+
+function readPrimaryToolResultText(content: unknown[], threadIdLine: string): string | null {
+	for (const item of content) {
+		if (!isRecord(item) || item.type !== "text" || typeof item.text !== "string" || item.text === threadIdLine) {
+			continue;
+		}
+		return item.text;
+	}
+
+	return null;
 }
 
 function createInterruptedToolCallMessage(reason: string | null): string {

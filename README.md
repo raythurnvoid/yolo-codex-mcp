@@ -28,6 +28,7 @@ Everything else is handled by the wrapper with fixed defaults:
 - `cwd`: derived server-side from the MCP client’s workspace/root context, with `process.cwd()` used only as a last-resort fallback
 - `model` / `profile`: not forced by the wrapper, so the inner official server keeps using normal Codex config resolution, including `CODEX_HOME` config and default profile behavior
 - `agent-instructions`: forwarded to the inner official tool as `developer-instructions`
+- thread context normalization: the wrapper injects the Smart Cheap Agent `threadId` into returned tool results directly, so a separate Cursor post-tool hook is not required
 - inner Codex binary resolution: override env first, then normal PATH lookup, then common Windows install locations and user shims, then WSL on Windows when available
 - completion fallback: if the inner Codex MCP stalls after a terminal rollout event, the wrapper resolves the rollout path, polls the rollout every 5 seconds, logs each poll cycle to `stderr`, synthesizes normal completions from `task_complete` / `turn_complete`, and synthesizes an `isError` interrupted result from `turn_aborted`
 
@@ -264,7 +265,9 @@ Forwarded to the inner official tool:
 
 Result shape:
 
+- `content` includes the latest Smart Cheap Agent message plus a trailing `threadId: <id>` text item for clients that only read tool text
 - `structuredContent.threadId` is the Smart Cheap Agent session/thread identifier
+- `structuredContent.thread_id` is also populated for compatibility with clients that expect snake_case
 - `structuredContent.content` is the latest Smart Cheap Agent message
 - to continue the same session, call `agent-reply` with the same `threadId`
 

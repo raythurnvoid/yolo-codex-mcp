@@ -21,7 +21,9 @@ Example:
 
 The result includes:
 
+- a trailing text item in `content` shaped like `threadId: <id>`
 - `structuredContent.threadId`: the session/thread identifier
+- `structuredContent.thread_id`: the same identifier in snake_case for compatibility
 - `structuredContent.content`: the latest Smart Cheap Agent message
 
 Follow-up:

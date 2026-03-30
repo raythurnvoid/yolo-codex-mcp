@@ -69,7 +69,7 @@ export function createReducedToolsListResult(): ListToolsResult {
 				name: primaryOuterToolNames.start,
 				title: "Smart Cheap Agent",
 				description:
-					"Preferred first tool for delegating complex, context-heavy work with proxy-managed policy settings. Smart Cheap Agent runs a smarter reasoning agent that can read and edit files, browse the web, and use MCP tools configured for the user; prefer it for architectural decisions, deep research, browser navigation, testing and QA, or multi-step debugging because it is usually cheaper and more cost-efficient than spending the host model's context. The response includes a human-readable answer in content/text plus structuredContent with threadId and content. To continue the same session, call agent-reply with the returned threadId from the prior response. Legacy aliases codex and codex-reply are still accepted for compatibility. For attached guidance, read yolo-codex-mcp://guides/operating-guide.md.",
+					"Preferred first tool for delegating complex, context-heavy work with proxy-managed policy settings. Smart Cheap Agent runs a smarter reasoning agent that can read and edit files, browse the web, and use MCP tools configured for the user; prefer it for architectural decisions, deep research, browser navigation, testing and QA, or multi-step debugging because it is usually cheaper and more cost-efficient than spending the host model's context. The response includes a human-readable answer in content/text, a trailing threadId text line, and structuredContent with threadId, thread_id, and content. To continue the same session, call agent-reply with the returned threadId from the prior response. Legacy aliases codex and codex-reply are still accepted for compatibility. For attached guidance, read yolo-codex-mcp://guides/operating-guide.md.",
 				inputSchema: {
 					type: "object",
 					properties: {
@@ -94,7 +94,7 @@ export function createReducedToolsListResult(): ListToolsResult {
 				name: primaryOuterToolNames.reply,
 				title: "Smart Cheap Agent Reply",
 				description:
-					"Continue the same Smart Cheap Agent session with proxy-managed policy settings. Pass the threadId returned by agent-start or a previous agent-reply call to keep the conversation on the same session. The response includes the same shape as agent-start: a human-readable answer in content/text plus structuredContent with threadId and content. Legacy aliases codex and codex-reply are still accepted for compatibility. For attached guidance, read yolo-codex-mcp://guides/operating-guide.md.",
+					"Continue the same Smart Cheap Agent session with proxy-managed policy settings. Pass the threadId returned by agent-start or a previous agent-reply call to keep the conversation on the same session. The response includes the same shape as agent-start: a human-readable answer in content/text, a trailing threadId text line, and structuredContent with threadId, thread_id, and content. Legacy aliases codex and codex-reply are still accepted for compatibility. For attached guidance, read yolo-codex-mcp://guides/operating-guide.md.",
 				inputSchema: {
 					type: "object",
 					properties: {
