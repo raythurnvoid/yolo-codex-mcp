@@ -15,8 +15,8 @@
 		"start": "node src/server.ts",
 		"dev": "node --watch src/server.ts",
 		"start:dist": "node dist/server.mjs",
-		"format": "prettier --write .",
-		"format:check": "prettier --check .",
+		"format": "node ./node_modules/prettier/bin/prettier.cjs --write .",
+		"format:check": "node ./node_modules/prettier/bin/prettier.cjs --check .",
 		"check": "pnpm run format:check && vp check --no-fmt",
 		"check:fix": "pnpm run format && vp check --fix --no-fmt",
 		"test": "node --test --test-concurrency=1 tests/proxy.test.ts"

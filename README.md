@@ -98,22 +98,23 @@ Run tests:
 pnpm test
 ```
 
-Run formatting, lint, and type checks:
+Run formatting (Prettier), lint, and type checks:
 
 ```bash
-vp check
+pnpm check
 ```
 
 Auto-fix formatting and lint issues where possible:
 
 ```bash
-vp check --fix
+pnpm run check:fix
 ```
 
-Format a specific path:
+Format the whole tree or a specific path:
 
 ```bash
-vp fmt <path>
+pnpm run format
+node ./node_modules/prettier/bin/prettier.cjs --write <path>
 ```
 
 ## MCP Configuration

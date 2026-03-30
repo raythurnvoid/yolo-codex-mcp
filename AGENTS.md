@@ -28,16 +28,18 @@ Do not modify `reference-submodules/` unless the user explicitly asks you to wor
 
 This repo intentionally uses:
 
-- Vite+ for formatting, linting, type-checking, and packaging
+- Prettier for formatting (see `.prettierrc` and `package.json` scripts)
+- Vite+ for linting, type-checking, and packaging
 - native Node.js TypeScript type stripping for local runtime
 - `pnpm` as the package manager recorded in `package.json`
 
 That means:
 
-- prefer Vite+ commands for checks and packaging
+- prefer `pnpm check` for full static verification (Prettier plus `vp check --no-fmt`)
+- prefer Vite+ commands for packaging and lint-driven fixes
 - use the package scripts for runtime entrypoints
 - do not reintroduce `tsx` for local runtime unless the user explicitly asks for it
-- do not reintroduce a standalone `tsc --noEmit` script when `vp check` already covers the required checks
+- do not reintroduce a standalone `tsc --noEmit` script when `pnpm check` already covers the required checks
 
 # Canonical Commands
 
@@ -46,21 +48,22 @@ Use these commands by default:
 - Install dependencies: `vp install`
 - Run the source server directly: `pnpm start`
 - Run in watch mode: `pnpm run dev`
-- Run all static checks: `vp check`
-- Auto-fix formatting/lint issues: `vp check --fix`
+- Run all static checks: `pnpm check`
+- Auto-fix formatting and lint issues: `pnpm run check:fix`
 - Build the distributable server: `vp pack`
 - Run the built artifact: `pnpm run start:dist`
 
-Prefer `vp check` over separate formatter, linter, or typechecker commands unless you are debugging a specific layer.
+Prefer `pnpm check` over running Prettier and `vp check` separately unless you are debugging a specific layer.
 
-If you need a focused formatter pass, use `vp fmt <path>`.
+If you need a focused formatter pass, use `pnpm exec prettier --write <path>` (or `pnpm run format` for the whole tree).
 
 # Vite+ Conventions
 
 Keep Vite+ as the source of truth for project automation.
 
-- Formatting and linting configuration belongs in `vite.config.ts`
-- Do not introduce separate Oxc or tsdown config files unless the user explicitly requests them
+- Prettier configuration belongs in `.prettierrc` (and ignore rules in `.prettierignore`)
+- Lint and type-check configuration belongs in the `lint` block of `vite.config.ts`
+- Do not introduce separate tsdown config files unless the user explicitly requests them
 - Keep the `lint.options.typeAware` and `lint.options.typeCheck` settings enabled unless there is a strong, intentional reason to change the verification model
 - Keep packaging configuration in the `pack` block of `vite.config.ts`
 
@@ -89,14 +92,14 @@ If a requested change would require those features, call that out explicitly ins
 
 # Formatting And Style
 
-Project style is enforced by Oxc through Vite+ and workspace settings.
+Project style is enforced by Prettier and workspace settings.
 
 - Use tabs, not spaces, for indentation in project code and config files that follow the formatter
 - Use double quotes
 - Keep line width compatible with `printWidth: 120`
 - Let the formatter drive layout instead of hand-formatting unusual styles
 
-Before finishing substantive work, run `vp check`. If it fails only because of formatting, run `vp check --fix` and re-run `vp check`.
+Before finishing substantive work, run `pnpm check`. If it fails only because of formatting, run `pnpm run format` and re-run `pnpm check`.
 
 Do not do broad stylistic cleanup outside the scope of the task.
 
@@ -162,7 +165,7 @@ Do not casually change these without a clear reason:
 - `@modelcontextprotocol/sdk` major version
 - stdio transport choice
 - `packageManager`
-- Oxc formatting/linting defaults
+- Prettier defaults in `.prettierrc` and Vite+ lint defaults in `vite.config.ts`
 
 If one of these must change, document the reason in `README.md` and verify the new workflow end to end.
 
@@ -170,7 +173,7 @@ If one of these must change, document the reason in `README.md` and verify the n
 
 Minimum verification for most code changes:
 
-- `vp check`
+- `pnpm check`
 
 Additional verification when relevant:
 
@@ -208,7 +211,7 @@ If you add a skill in this repo, keep the skill focused, give it a strong `descr
 A task is usually done in this repo when:
 
 - the requested code or config change is implemented with a minimal diff
-- `vp check` passes
+- `pnpm check` passes
 - `pnpm test` passes when proxy/runtime behavior changed
 - `vp pack` passes when build behavior may have been affected
 - runtime was smoke-tested when startup behavior changed

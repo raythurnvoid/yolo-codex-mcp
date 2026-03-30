@@ -76,7 +76,7 @@ afterEach(async () => {
 
 /**
  * Creates a tool result object that includes the thread id and content.
- * 
+ *
  * @param threadId - The thread id to include in the tool result.
  * @param text - The content to include in the tool result.
  * @param options - Optional parameters to control the tool result.
