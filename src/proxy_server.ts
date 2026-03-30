@@ -29,6 +29,8 @@ import {
 	buildInnerCodexReplyArguments,
 	createReducedToolsListResult,
 	createToolCallErrorResult,
+	normalizeOuterToolName,
+	type OuterToolName,
 	parseOuterCodexCall,
 	parseOuterCodexReplyCall,
 } from "./tool_contract.ts";
@@ -57,8 +59,9 @@ type PendingToolCall = {
 	rolloutPath: string | null;
 	startedAtMs: number;
 	syntheticCompletionSent: boolean;
+	syntheticResultKind: "completion" | "interrupted" | null;
 	threadId: string | null;
-	toolName: "codex" | "codex-reply";
+	toolName: OuterToolName;
 };
 
 type ResolvedSessionRoot = {
@@ -69,14 +72,17 @@ type ResolvedSessionRoot = {
 
 type CodexEventSnapshot = {
 	lastAgentMessage: string | null;
+	reason: string | null;
 	requestId: JsonRpcId | null;
 	rolloutPath: string | null;
 	threadId: string | null;
 	type: string | null;
 };
 
-type RolloutTaskCompleteSnapshot = {
+type RolloutTerminalSnapshot = {
 	lastAgentMessage: string | null;
+	reason: string | null;
+	terminalState: "completed" | "aborted";
 	threadId: string | null;
 };
 
@@ -400,24 +406,25 @@ async function handleToolsCallRequest(
 	}
 
 	const requestParams = { ...params } as Record<string, unknown>;
-	const toolName = typeof requestParams.name === "string" ? requestParams.name : null;
-	if (toolName === null) {
+	const requestedToolName = typeof requestParams.name === "string" ? requestParams.name.trim() : null;
+	if (requestedToolName === null || requestedToolName === "") {
 		await context.clientWriter.write(
 			createJsonRpcResponse(message.id, createToolCallErrorResult("Expected tools/call params.name to be a string")),
 		);
 		return;
 	}
+	const toolName = normalizeOuterToolName(requestedToolName);
 
 	try {
 		if (toolName === "codex") {
-			const call = parseOuterCodexCall(requestParams.arguments);
+			const call = parseOuterCodexCall(requestParams.arguments, requestedToolName);
 			if (call.legacyCwd !== null) {
-				logIgnoredLegacyToolCwd(message.id, "codex", call.legacyCwd);
+				logIgnoredLegacyToolCwd(message.id, requestedToolName as OuterToolName, call.legacyCwd);
 			}
 			await maybeRequestClientRoots("tools/call", context);
 			const resolvedCwd = resolveToolCallCwd(context.clientWorkspaceState);
-			logToolCallCwdDecision(message.id, "codex", resolvedCwd, context.clientWorkspaceState);
-			const pendingToolCall = createPendingToolCall(message.id, "codex");
+			logToolCallCwdDecision(message.id, requestedToolName as OuterToolName, resolvedCwd, context.clientWorkspaceState);
+			const pendingToolCall = createPendingToolCall(message.id, requestedToolName as OuterToolName);
 			const forwardedArguments = buildInnerCodexArguments(
 				{
 					...call,
@@ -425,7 +432,7 @@ async function handleToolsCallRequest(
 				},
 				context.config.policy,
 			);
-			logForwardedToolArguments(message.id, "codex", forwardedArguments);
+			logForwardedToolArguments(message.id, requestedToolName as OuterToolName, forwardedArguments);
 			context.pendingToolCalls.set(jsonRpcIdKey(message.id), pendingToolCall);
 			try {
 				await context.innerWriter.write({
@@ -449,14 +456,14 @@ async function handleToolsCallRequest(
 		}
 
 		if (toolName === "codex-reply") {
-			const call = parseOuterCodexReplyCall(requestParams.arguments);
+			const call = parseOuterCodexReplyCall(requestParams.arguments, requestedToolName);
 			if (call.legacyCwd !== null) {
-				logIgnoredLegacyToolCwd(message.id, "codex-reply", call.legacyCwd);
+				logIgnoredLegacyToolCwd(message.id, requestedToolName as OuterToolName, call.legacyCwd);
 			}
 			await maybeRequestClientRoots("tools/call", context);
 			const resolvedCwd = resolveToolCallCwd(context.clientWorkspaceState);
-			logToolCallCwdDecision(message.id, "codex-reply", resolvedCwd, context.clientWorkspaceState);
-			const pendingToolCall = createPendingToolCall(message.id, "codex-reply", call.threadId);
+			logToolCallCwdDecision(message.id, requestedToolName as OuterToolName, resolvedCwd, context.clientWorkspaceState);
+			const pendingToolCall = createPendingToolCall(message.id, requestedToolName as OuterToolName, call.threadId);
 			const forwardedArguments = buildInnerCodexReplyArguments(
 				{
 					...call,
@@ -464,7 +471,7 @@ async function handleToolsCallRequest(
 				},
 				context.config.policy,
 			);
-			logForwardedToolArguments(message.id, "codex-reply", forwardedArguments);
+			logForwardedToolArguments(message.id, requestedToolName as OuterToolName, forwardedArguments);
 			context.pendingToolCalls.set(jsonRpcIdKey(message.id), pendingToolCall);
 			try {
 				await context.innerWriter.write({
@@ -557,6 +564,13 @@ async function onInnerMessage(
 		const pendingToolCall = context.pendingToolCalls.get(jsonRpcIdKey(message.id));
 		if (pendingToolCall) {
 			if (pendingToolCall.syntheticCompletionSent) {
+				if (pendingToolCall.syntheticResultKind === "interrupted") {
+					process.stderr.write(
+						`[yolo-codex-mcp] Suppressed late inner response after synthetic interruption completion for ${formatPendingToolCallLogContext(
+							pendingToolCall,
+						)}.\n`,
+					);
+				}
 				finishPendingToolCall(pendingToolCall, context.pendingToolCalls);
 				return;
 			}
@@ -1097,6 +1111,7 @@ function createPendingToolCall(
 		rolloutPath: null,
 		startedAtMs: Date.now(),
 		syntheticCompletionSent: false,
+		syntheticResultKind: null,
 		threadId,
 		toolName,
 	};
@@ -1156,6 +1171,7 @@ function retainPendingToolCallUntilInnerCompletion(
 async function observeCodexEvent(
 	message: JsonRpcMessage,
 	context: {
+		clientWriter: JsonRpcLineWriter;
 		pendingToolCalls: Map<string, PendingToolCall>;
 		sessionRoot: ResolvedSessionRoot | null;
 	},
@@ -1171,7 +1187,7 @@ async function observeCodexEvent(
 	const pendingToolCall =
 		(snapshot.requestId !== null ? context.pendingToolCalls.get(jsonRpcIdKey(snapshot.requestId)) : undefined) ??
 		findPendingToolCallByThreadId(context.pendingToolCalls, snapshot.threadId);
-	if (!pendingToolCall) {
+	if (!pendingToolCall || pendingToolCall.completed || pendingToolCall.syntheticCompletionSent) {
 		return;
 	}
 
@@ -1189,6 +1205,15 @@ async function observeCodexEvent(
 		pendingToolCall.lastAgentMessage = snapshot.lastAgentMessage;
 	}
 	await resolvePendingToolCallRolloutPath(pendingToolCall, context.sessionRoot);
+	if (snapshot.type === "turn_aborted") {
+		process.stderr.write(
+			`[yolo-codex-mcp] Observed turn_aborted via live codex/event for ${formatPendingToolCallLogContext(
+				pendingToolCall,
+				snapshot.reason,
+			)}.\n`,
+		);
+		await emitSyntheticInterruptedToolCallResult(pendingToolCall, context, "live codex/event", snapshot.reason);
+	}
 }
 
 function setPendingToolCallRolloutPath(
@@ -1238,6 +1263,7 @@ function parseCodexEventSnapshot(message: JsonRpcMessage): CodexEventSnapshot | 
 	const eventMessage = isRecord(message.params.msg) ? message.params.msg : null;
 	return {
 		lastAgentMessage: readOptionalRecordString(eventMessage, "last_agent_message"),
+		reason: readOptionalRecordString(eventMessage, "reason"),
 		requestId: readJsonRpcId(meta?.requestId),
 		rolloutPath: readOptionalRecordString(eventMessage, "rollout_path"),
 		threadId:
@@ -1272,7 +1298,7 @@ async function pollPendingToolCall(
 		}
 
 		const rolloutSnapshot =
-			pendingToolCall.rolloutPath === null ? null : await readRolloutTaskCompleteSnapshot(pendingToolCall.rolloutPath);
+			pendingToolCall.rolloutPath === null ? null : await readRolloutTerminalSnapshot(pendingToolCall.rolloutPath);
 		const rolloutThreadId = rolloutSnapshot?.threadId ?? null;
 		if (rolloutThreadId !== null) {
 			pendingToolCall.threadId = rolloutThreadId;
@@ -1280,6 +1306,16 @@ async function pollPendingToolCall(
 		const rolloutLastAgentMessage = rolloutSnapshot?.lastAgentMessage ?? null;
 		if (rolloutLastAgentMessage !== null) {
 			pendingToolCall.lastAgentMessage = rolloutLastAgentMessage;
+		}
+		if (rolloutSnapshot?.terminalState === "aborted") {
+			process.stderr.write(
+				`[yolo-codex-mcp] Observed turn_aborted via rollout polling for ${formatPendingToolCallLogContext(
+					pendingToolCall,
+					rolloutSnapshot.reason,
+				)}.\n`,
+			);
+			await emitSyntheticInterruptedToolCallResult(pendingToolCall, context, "rollout polling", rolloutSnapshot.reason);
+			return;
 		}
 
 		const threadId =
@@ -1296,6 +1332,7 @@ async function pollPendingToolCall(
 			),
 		);
 		pendingToolCall.syntheticCompletionSent = true;
+		pendingToolCall.syntheticResultKind = "completion";
 		retainPendingToolCallUntilInnerCompletion(pendingToolCall, context.pendingToolCalls);
 		process.stderr.write(
 			`[yolo-codex-mcp] Synthesized ${pendingToolCall.toolName} completion from rollout polling for request ${String(
@@ -1308,6 +1345,42 @@ async function pollPendingToolCall(
 	} finally {
 		pendingToolCall.pollInFlight = false;
 	}
+}
+
+async function emitSyntheticInterruptedToolCallResult(
+	pendingToolCall: PendingToolCall,
+	context: {
+		clientWriter: JsonRpcLineWriter;
+		pendingToolCalls: Map<string, PendingToolCall>;
+		sessionRoot: ResolvedSessionRoot | null;
+	},
+	source: "live codex/event" | "rollout polling",
+	reason: string | null,
+): Promise<void> {
+	if (pendingToolCall.completed || pendingToolCall.syntheticCompletionSent) {
+		return;
+	}
+
+	await resolvePendingToolCallRolloutPath(pendingToolCall, context.sessionRoot);
+	const threadId =
+		pendingToolCall.threadId ??
+		(pendingToolCall.rolloutPath === null ? null : inferThreadIdFromRolloutPath(pendingToolCall.rolloutPath));
+	if (threadId !== null) {
+		pendingToolCall.threadId = threadId;
+	}
+
+	await context.clientWriter.write(
+		createJsonRpcResponse(pendingToolCall.callId, createSyntheticInterruptedToolCallResult(threadId, reason)),
+	);
+	pendingToolCall.syntheticCompletionSent = true;
+	pendingToolCall.syntheticResultKind = "interrupted";
+	retainPendingToolCallUntilInnerCompletion(pendingToolCall, context.pendingToolCalls);
+	process.stderr.write(
+		`[yolo-codex-mcp] Synthesized ${pendingToolCall.toolName} interruption result from ${source} for ${formatPendingToolCallLogContext(
+			pendingToolCall,
+			reason,
+		)}.\n`,
+	);
 }
 
 async function resolvePendingToolCallRolloutPath(
@@ -1390,8 +1463,8 @@ function matchesRolloutFileName(fileName: string, threadId: string | null): bool
 	return threadId === null ? true : fileName.endsWith(`-${threadId}.jsonl`);
 }
 
-async function readRolloutTaskCompleteSnapshot(rolloutPath: string): Promise<RolloutTaskCompleteSnapshot | null> {
-	return parseRolloutTaskCompleteLine(await readLastRolloutLine(rolloutPath));
+async function readRolloutTerminalSnapshot(rolloutPath: string): Promise<RolloutTerminalSnapshot | null> {
+	return parseRolloutTerminalLine(await readLastRolloutLine(rolloutPath));
 }
 
 async function readLastRolloutLine(rolloutPath: string): Promise<string | null> {
@@ -1425,7 +1498,7 @@ async function readLastRolloutLine(rolloutPath: string): Promise<string | null> 
 	}
 }
 
-function parseRolloutTaskCompleteLine(line: string | null): RolloutTaskCompleteSnapshot | null {
+function parseRolloutTerminalLine(line: string | null): RolloutTerminalSnapshot | null {
 	if (!line) {
 		return null;
 	}
@@ -1443,12 +1516,14 @@ function parseRolloutTaskCompleteLine(line: string | null): RolloutTaskCompleteS
 	const payload = isRecord(parsed.payload) ? parsed.payload : parsed;
 	const eventMessage = isRecord(payload.msg) ? payload.msg : null;
 	const eventType = readOptionalRecordString(eventMessage, "type");
-	if (eventType !== "task_complete" && eventType !== "turn_complete") {
+	if (eventType !== "task_complete" && eventType !== "turn_complete" && eventType !== "turn_aborted") {
 		return null;
 	}
 
 	return {
 		lastAgentMessage: readOptionalRecordString(eventMessage, "last_agent_message"),
+		reason: readOptionalRecordString(eventMessage, "reason"),
+		terminalState: eventType === "turn_aborted" ? "aborted" : "completed",
 		threadId:
 			readOptionalRecordString(payload, "threadId") ??
 			readOptionalRecordString(isRecord(payload._meta) ? payload._meta : null, "threadId"),
@@ -1468,6 +1543,45 @@ function createSyntheticToolCallResult(threadId: string, content: string) {
 			content,
 		},
 	};
+}
+
+function createSyntheticInterruptedToolCallResult(threadId: string | null, reason: string | null) {
+	const content = createInterruptedToolCallMessage(reason);
+	return {
+		content: [
+			{
+				type: "text",
+				text: content,
+			},
+		],
+		isError: true,
+		...(threadId === null
+			? {}
+			: {
+					structuredContent: {
+						threadId,
+						content,
+					},
+				}),
+	};
+}
+
+function createInterruptedToolCallMessage(reason: string | null): string {
+	if (reason === "replaced") {
+		return "Smart Cheap Agent run was aborted before the inner MCP returned a final tool result (reason: replaced).";
+	}
+	if (reason === "review_ended") {
+		return "Smart Cheap Agent run was aborted before the inner MCP returned a final tool result (reason: review_ended).";
+	}
+	return `Smart Cheap Agent run was interrupted before the inner MCP returned a final tool result${
+		reason === null ? "." : ` (reason: ${reason}).`
+	}`;
+}
+
+function formatPendingToolCallLogContext(pendingToolCall: PendingToolCall, reason: string | null = null): string {
+	return `request ${String(pendingToolCall.callId)}${pendingToolCall.threadId === null ? "" : ` thread ${pendingToolCall.threadId}`}${
+		pendingToolCall.rolloutPath === null ? "" : ` rollout ${pendingToolCall.rolloutPath}`
+	}${reason === null ? "" : ` reason ${reason}`}`;
 }
 
 function inferThreadIdFromRolloutPath(rolloutPath: string): string | null {

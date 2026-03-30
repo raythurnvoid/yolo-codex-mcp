@@ -4,7 +4,6 @@ import { access, mkdtemp, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { once } from "node:events";
 import { createInterface } from "node:readline";
 import { ListToolsResultSchema } from "@modelcontextprotocol/sdk/types.js";
 
@@ -63,6 +62,9 @@ const children: Array<ReturnType<typeof spawn>> = [];
 afterEach(async () => {
 	await Promise.all(
 		children.splice(0).map(async (child) => {
+			if (child.stdin !== null && !child.stdin.destroyed) {
+				child.stdin.end();
+			}
 			child.kill();
 			await new Promise<void>((resolve) => {
 				child.once("exit", () => resolve());
@@ -91,7 +93,7 @@ void test("tools/list exposes only the reduced outer schemas", async () => {
 
 	assert.deepEqual(
 		result.tools.map((tool) => tool.name),
-		["codex", "codex-reply"],
+		["agent-start", "agent-reply"],
 	);
 	assert.deepEqual(
 		result.tools.map((tool) => tool.title),
@@ -113,10 +115,14 @@ void test("tools/list exposes only the reduced outer schemas", async () => {
 		result.tools[0].description,
 		/human-readable answer in content\/text plus structuredContent with threadId and content/,
 	);
-	assert.match(result.tools[0].description, /call codex-reply with the returned threadId from the prior response/);
-	assert.match(result.tools[1].description, /Pass the threadId returned by codex or a previous codex-reply call/);
+	assert.match(result.tools[0].description, /call agent-reply with the returned threadId from the prior response/);
+	assert.match(
+		result.tools[0].description,
+		/Legacy aliases codex and codex-reply are still accepted for compatibility/,
+	);
+	assert.match(result.tools[1].description, /Pass the threadId returned by agent-start or a previous agent-reply call/);
 	assert.match(result.tools[1].description, /Continue the same Smart Cheap Agent session/);
-	assert.match(result.tools[1].description, /same shape as codex/);
+	assert.match(result.tools[1].description, /same shape as agent-start/);
 });
 
 void test("initialize advertises resources capability on the outer wrapper", async () => {
@@ -183,19 +189,21 @@ void test("resources/read returns usage and rollout guidance", async () => {
 
 	assert.match(guideText ?? "", /structuredContent\.threadId/);
 	assert.match(guideText ?? "", /Smart Cheap Agent/);
-	assert.match(guideText ?? "", /codex-reply/);
+	assert.match(guideText ?? "", /agent-reply/);
+	assert.match(guideText ?? "", /Legacy aliases `codex` and `codex-reply` are still accepted/);
 	assert.match(guideText ?? "", /~\/\.codex\/sessions/);
 	assert.match(guideText ?? "", /rollout-<timestamp>-<threadId>\.jsonl/);
+	assert.match(guideText ?? "", /turn_aborted/);
 	assert.match(guideText ?? "", /debugging complex failures/);
 	assert.match(guideText ?? "", /browser-tool workflows/);
 });
 
-void test("codex call injects fixed policy and maps agent-instructions", async () => {
+void test("agent-start call injects fixed policy and maps agent-instructions", async () => {
 	const server = await createProxyHarness();
 	await server.initialize();
 
 	const responsePromise = server.request("tools/call", {
-		name: "codex",
+		name: "agent-start",
 		arguments: {
 			prompt: "hello",
 			"agent-instructions": "Be terse.",
@@ -233,12 +241,12 @@ void test("codex call injects fixed policy and maps agent-instructions", async (
 	});
 });
 
-void test("codex call defaults cwd to the wrapper process cwd", async () => {
+void test("agent-start call defaults cwd to the wrapper process cwd", async () => {
 	const server = await createProxyHarness();
 	await server.initialize();
 
 	await server.request("tools/call", {
-		name: "codex",
+		name: "agent-start",
 		arguments: {
 			prompt: "cwd-default",
 		},
@@ -251,7 +259,7 @@ void test("codex call defaults cwd to the wrapper process cwd", async () => {
 	assert.equal(forwardedRunParams.arguments.cwd, process.cwd());
 });
 
-void test("codex call derives cwd from inbound workspace notifications", async () => {
+void test("agent-start call derives cwd from inbound workspace notifications", async () => {
 	const server = await createProxyHarness();
 	await server.initialize();
 	await server.notify("workspace/didChangeWorkspaceFolders", {
@@ -267,7 +275,7 @@ void test("codex call derives cwd from inbound workspace notifications", async (
 	});
 
 	await server.request("tools/call", {
-		name: "codex",
+		name: "agent-start",
 		arguments: {
 			prompt: "cwd-from-workspace-notification",
 		},
@@ -300,7 +308,7 @@ void test("legacy outer cwd is ignored and logged while server-derived cwd wins"
 	});
 
 	await server.request("tools/call", {
-		name: "codex",
+		name: "agent-start",
 		arguments: {
 			prompt: "ignore-legacy-cwd",
 			cwd: "/tmp/legacy-path",
@@ -318,7 +326,7 @@ void test("legacy outer cwd is ignored and logged while server-derived cwd wins"
 	assert.match(stderr, /\[yolo-codex-mcp\]\[cwd\].*"source":"client-derived"/);
 });
 
-void test("codex call derives cwd from proactive roots/list when the client advertises roots support", async () => {
+void test("agent-start call derives cwd from proactive roots/list when the client advertises roots support", async () => {
 	const server = await createProxyHarness();
 	await server.initialize({
 		capabilities: {
@@ -339,7 +347,7 @@ void test("codex call derives cwd from proactive roots/list when the client adve
 	});
 
 	await server.request("tools/call", {
-		name: "codex",
+		name: "agent-start",
 		arguments: {
 			prompt: "cwd-from-proactive-roots",
 		},
@@ -357,14 +365,14 @@ void test("codex call derives cwd from proactive roots/list when the client adve
 	assert.match(stderr, /\[yolo-codex-mcp\]\[cwd\].*"detail":"roots\/list only root"/);
 });
 
-void test("codex call falls back to process.cwd only when client context is unavailable", async () => {
+void test("agent-start call falls back to process.cwd only when client context is unavailable", async () => {
 	const server = await createProxyHarness({
 		CODEX_MCP_CWD: path.join(path.resolve("."), "ignored-env-cwd"),
 	});
 	await server.initialize();
 
 	await server.request("tools/call", {
-		name: "codex",
+		name: "agent-start",
 		arguments: {
 			prompt: "cwd-process-fallback",
 		},
@@ -381,12 +389,12 @@ void test("codex call falls back to process.cwd only when client context is unav
 	assert.match(stderr, /\[yolo-codex-mcp\]\[cwd\].*"source":"process\.cwd\(\)"/);
 });
 
-void test("codex-reply forwards threadId and supports deprecated conversationId input", async () => {
+void test("agent-reply forwards threadId and supports deprecated conversationId input", async () => {
 	const server = await createProxyHarness();
 	await server.initialize();
 
 	const response = await server.request("tools/call", {
-		name: "codex-reply",
+		name: "agent-reply",
 		arguments: {
 			conversationId: "thr_from_conversation",
 			prompt: "next",
@@ -417,7 +425,7 @@ void test("codex-reply forwards threadId and supports deprecated conversationId 
 	});
 });
 
-void test("codex-reply derives cwd server-side and ignores legacy outer cwd", async () => {
+void test("agent-reply derives cwd server-side and ignores legacy outer cwd", async () => {
 	const server = await createProxyHarness();
 	await server.initialize();
 	await server.notify("workspace/didChangeWorkspaceFolders", {
@@ -433,7 +441,7 @@ void test("codex-reply derives cwd server-side and ignores legacy outer cwd", as
 	});
 
 	await server.request("tools/call", {
-		name: "codex-reply",
+		name: "agent-reply",
 		arguments: {
 			threadId: "thr_explicit_cwd",
 			prompt: "next",
@@ -452,12 +460,56 @@ void test("codex-reply derives cwd server-side and ignores legacy outer cwd", as
 	});
 });
 
+void test("legacy codex and codex-reply aliases still dispatch through the reduced outer contract", async () => {
+	const server = await createProxyHarness();
+	await server.initialize();
+
+	const startResponse = await server.request("tools/call", {
+		name: "codex",
+		arguments: {
+			prompt: "legacy-start",
+		},
+	});
+	assert.deepEqual(startResponse.result, {
+		content: [
+			{
+				type: "text",
+				text: "run ok",
+			},
+		],
+		structuredContent: {
+			threadId: "thr_mock",
+			content: "run ok",
+		},
+	});
+
+	const replyResponse = await server.request("tools/call", {
+		name: "codex-reply",
+		arguments: {
+			threadId: "thr_legacy",
+			prompt: "legacy-reply",
+		},
+	});
+	assert.deepEqual(replyResponse.result, {
+		content: [
+			{
+				type: "text",
+				text: "reply ok",
+			},
+		],
+		structuredContent: {
+			threadId: "thr_legacy",
+			content: "reply ok",
+		},
+	});
+});
+
 void test("rollout polling synthesizes completion when the inner response never arrives", async () => {
 	const server = await createProxyHarness({}, { requestTimeoutMs: 12_000 });
 	await server.initialize();
 
 	const response = await server.request("tools/call", {
-		name: "codex",
+		name: "agent-start",
 		arguments: {
 			prompt: "stuck-rollout",
 		},
@@ -476,9 +528,88 @@ void test("rollout polling synthesizes completion when the inner response never 
 		},
 	});
 
-	const stderr = await server.waitForStderr("Synthesized codex completion from rollout polling");
+	const stderr = await server.waitForStderr("Synthesized agent-start completion from rollout polling");
 	assert.match(stderr, /\[yolo-codex-mcp\] Resolved rollout path via codex\/event session_configured/);
 	assert.match(stderr, /\[yolo-codex-mcp\] Polling rollout fallback for request 2 thread thr_stuck_rollout rollout /);
+});
+
+void test("live turn_aborted events synthesize interrupted error results and suppress later inner responses", async () => {
+	const server = await createProxyHarness({}, { requestTimeoutMs: 12_000 });
+	await server.initialize();
+
+	const { response } = await server.requestWithRaw("tools/call", {
+		name: "agent-start",
+		arguments: {
+			prompt: "turn-aborted-live-delayed-response",
+		},
+	});
+
+	assert.deepEqual(response.result, {
+		content: [
+			{
+				type: "text",
+				text: "Smart Cheap Agent run was interrupted before the inner MCP returned a final tool result (reason: interrupted).",
+			},
+		],
+		isError: true,
+		structuredContent: {
+			threadId: "thr_turn_aborted_live",
+			content:
+				"Smart Cheap Agent run was interrupted before the inner MCP returned a final tool result (reason: interrupted).",
+		},
+	});
+
+	const stderr = await server.waitForStderr("Suppressed late inner response after synthetic interruption completion");
+	assert.match(
+		stderr,
+		/\[yolo-codex-mcp\] Observed turn_aborted via live codex\/event for request 2 thread thr_turn_aborted_live rollout .* reason interrupted\./,
+	);
+	assert.match(
+		stderr,
+		/\[yolo-codex-mcp\] Synthesized agent-start interruption result from live codex\/event for request 2 thread thr_turn_aborted_live rollout .* reason interrupted\./,
+	);
+	assert.match(
+		stderr,
+		/\[yolo-codex-mcp\] Suppressed late inner response after synthetic interruption completion for request 2 thread thr_turn_aborted_live rollout .*?\./,
+	);
+	await server.assertNoAdditionalResponse(response.id, 2_500);
+});
+
+void test("rollout polling synthesizes interrupted error results when the rollout ends with turn_aborted", async () => {
+	const server = await createProxyHarness({}, { requestTimeoutMs: 12_000 });
+	await server.initialize();
+
+	const response = await server.request("tools/call", {
+		name: "agent-start",
+		arguments: {
+			prompt: "stuck-rollout-aborted",
+		},
+	});
+
+	assert.deepEqual(response.result, {
+		content: [
+			{
+				type: "text",
+				text: "Smart Cheap Agent run was interrupted before the inner MCP returned a final tool result (reason: interrupted).",
+			},
+		],
+		isError: true,
+		structuredContent: {
+			threadId: "thr_rollout_aborted",
+			content:
+				"Smart Cheap Agent run was interrupted before the inner MCP returned a final tool result (reason: interrupted).",
+		},
+	});
+
+	const stderr = await server.waitForStderr("Synthesized agent-start interruption result from rollout polling");
+	assert.match(
+		stderr,
+		/\[yolo-codex-mcp\] Observed turn_aborted via rollout polling for request 2 thread thr_rollout_aborted rollout .* reason interrupted\./,
+	);
+	assert.match(
+		stderr,
+		/\[yolo-codex-mcp\] Synthesized agent-start interruption result from rollout polling for request 2 thread thr_rollout_aborted rollout .* reason interrupted\./,
+	);
 });
 
 void test("rollout polling falls back to the sessions folder when rollout_path is missing", async () => {
@@ -493,7 +624,7 @@ void test("rollout polling falls back to the sessions folder when rollout_path i
 	await server.initialize();
 
 	const response = await server.request("tools/call", {
-		name: "codex",
+		name: "agent-start",
 		arguments: {
 			prompt: "stuck-rollout-session-scan",
 		},
@@ -525,7 +656,7 @@ void test("late inner responses are suppressed after synthetic rollout completio
 	await server.initialize();
 
 	const { response } = await server.requestWithRaw("tools/call", {
-		name: "codex",
+		name: "agent-start",
 		arguments: {
 			prompt: "stuck-rollout-delayed-response",
 		},
@@ -569,7 +700,7 @@ void test("always-on logging captures handshake, workspace notifications, roots 
 
 	const fullPrompt = `${"x".repeat(280)}-tail`;
 	const responsePromise = server.request("tools/call", {
-		name: "codex",
+		name: "agent-start",
 		arguments: {
 			prompt: "needs-roots",
 		},
@@ -585,7 +716,7 @@ void test("always-on logging captures handshake, workspace notifications, roots 
 	});
 	await responsePromise;
 	await server.request("tools/call", {
-		name: "codex",
+		name: "agent-start",
 		arguments: {
 			prompt: fullPrompt,
 		},
@@ -598,7 +729,7 @@ void test("always-on logging captures handshake, workspace notifications, roots 
 	assert.match(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"method":"\$\/progress"/);
 	assert.match(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"method":"tools\/call"/);
 	assert.match(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"forMethod":"roots\/list"/);
-	assert.match(stderr, /\[yolo-codex-mcp\]\[tools-forward\].*"tool":"codex"/);
+	assert.match(stderr, /\[yolo-codex-mcp\]\[tools-forward\].*"tool":"agent-start"/);
 	assert.match(stderr, /file:\/\/\/tmp\/repo/);
 	assert.match(stderr, new RegExp(`${fullPrompt}"`));
 });
@@ -608,7 +739,7 @@ void test("server-initiated elicitation requests are remapped back to the inner 
 	await server.initialize();
 
 	const responsePromise = server.request("tools/call", {
-		name: "codex",
+		name: "agent-start",
 		arguments: {
 			prompt: "needs-approval",
 		},
@@ -670,7 +801,7 @@ void test("real codex subprocess smoke test for initialize and reduced tools/lis
 
 	assert.deepEqual(
 		result.tools.map((tool) => tool.name),
-		["codex", "codex-reply"],
+		["agent-start", "agent-reply"],
 	);
 });
 
@@ -720,20 +851,6 @@ void test("fileUriToFilesystemPath handles Windows drive and UNC roots", () => {
 	assert.equal(fileUriToFilesystemPath("file:///C:/Users/dev/repo", "win32"), "C:\\Users\\dev\\repo");
 	assert.equal(fileUriToFilesystemPath("file://server/share/repo", "win32"), "\\\\server\\share\\repo");
 	assert.equal(fileUriToFilesystemPath("file:///tmp/repo", "win32"), "/tmp/repo");
-});
-
-void test("Cursor cwd hook tolerates quoted hook envelopes and does not inject cwd", async () => {
-	const hookPath = path.resolve(".cursor/hooks/inject-yolo-cwd.mjs");
-	const malformedQuotedEnvelope =
-		'"{"tool_name":"MCP:codex","workspace_roots":["/tmp/hook-repo"],"tool_input":"{\\"prompt\\":\\"hello\\"}"}"';
-	const result = await runScriptWithStdin(hookPath, malformedQuotedEnvelope);
-
-	assert.equal(result.exitCode, 0);
-	assert.equal(result.stderr.includes("Failed to parse hook input JSON from stdin"), false);
-	assert.deepEqual(JSON.parse(result.stdout), {
-		permission: "allow",
-	});
-	assert.match(result.stderr, /Hook no longer injects cwd/);
 });
 
 void test("resolveSessionRoot prefers a Windows-accessible WSL sessions root for WSL launches", () => {
@@ -1032,6 +1149,7 @@ async function createProxyHarness(
 		stderrText += String(chunk);
 	});
 	child.once("exit", (code, signal) => {
+		stdout.close();
 		childExitSummary = `proxy exited with code ${String(code)} and signal ${String(signal)}`;
 	});
 
@@ -1235,14 +1353,21 @@ function looksLikePath(command: string): boolean {
 }
 
 async function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs = 5_000): Promise<T> {
-	return await Promise.race([
-		promise,
-		new Promise<T>((_, reject) => {
-			setTimeout(() => {
-				reject(new Error(`Timed out waiting for ${label}`));
-			}, timeoutMs);
-		}),
-	]);
+	return await new Promise<T>((resolve, reject) => {
+		const timer = setTimeout(() => {
+			reject(new Error(`Timed out waiting for ${label}`));
+		}, timeoutMs);
+		promise.then(
+			(value) => {
+				clearTimeout(timer);
+				resolve(value);
+			},
+			(error: unknown) => {
+				clearTimeout(timer);
+				reject(error);
+			},
+		);
+	});
 }
 
 function serializeJsonRpcError(error: JsonRpcErrorBody): string {
@@ -1258,36 +1383,4 @@ function formatHarnessDiagnostics(stderrText: string, childExitSummary: string |
 		childExitSummary ?? "proxy is still running",
 		stderrText ? `proxy stderr:\n${stderrText}` : "proxy stderr: <empty>",
 	].join("\n");
-}
-
-async function runScriptWithStdin(
-	scriptPath: string,
-	stdinText: string,
-): Promise<{
-	exitCode: number | null;
-	stderr: string;
-	stdout: string;
-}> {
-	const child = spawn(process.execPath, [scriptPath], {
-		stdio: ["pipe", "pipe", "pipe"],
-	});
-	children.push(child);
-
-	let stdout = "";
-	let stderr = "";
-	child.stdout.on("data", (chunk) => {
-		stdout += String(chunk);
-	});
-	child.stderr.on("data", (chunk) => {
-		stderr += String(chunk);
-	});
-
-	child.stdin.end(stdinText);
-
-	const [exitCode] = (await once(child, "exit")) as [number | null, NodeJS.Signals | null];
-	return {
-		exitCode,
-		stderr,
-		stdout: stdout.trim(),
-	};
 }

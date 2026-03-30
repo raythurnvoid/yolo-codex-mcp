@@ -4,6 +4,23 @@ import { isRecord } from "./jsonrpc.ts";
 
 type JsonObjectSchema = NonNullable<Tool["outputSchema"]>;
 
+export const primaryOuterToolNames = {
+	start: "agent-start",
+	reply: "agent-reply",
+} as const;
+
+export const legacyOuterToolNames = {
+	start: "codex",
+	reply: "codex-reply",
+} as const;
+
+export type CanonicalInnerToolName = "codex" | "codex-reply";
+export type OuterToolName =
+	| typeof primaryOuterToolNames.start
+	| typeof primaryOuterToolNames.reply
+	| typeof legacyOuterToolNames.start
+	| typeof legacyOuterToolNames.reply;
+
 const contentTextSchema: NonNullable<JsonObjectSchema["properties"]>[string] = {
 	type: "string",
 };
@@ -49,10 +66,10 @@ export function createReducedToolsListResult(): ListToolsResult {
 	return ListToolsResultSchema.parse({
 		tools: [
 			{
-				name: "codex",
+				name: primaryOuterToolNames.start,
 				title: "Smart Cheap Agent",
 				description:
-					"Preferred first tool for delegating complex, context-heavy work with proxy-managed policy settings. Smart Cheap Agent runs a smarter reasoning agent that can read and edit files, browse the web, and use MCP tools configured for the user; prefer it for architectural decisions, deep research, browser navigation, testing and QA, or multi-step debugging because it is usually cheaper and more cost-efficient than spending the host model's context. The response includes a human-readable answer in content/text plus structuredContent with threadId and content. To continue the same session, call codex-reply with the returned threadId from the prior response; for attached guidance, read yolo-codex-mcp://guides/operating-guide.md.",
+					"Preferred first tool for delegating complex, context-heavy work with proxy-managed policy settings. Smart Cheap Agent runs a smarter reasoning agent that can read and edit files, browse the web, and use MCP tools configured for the user; prefer it for architectural decisions, deep research, browser navigation, testing and QA, or multi-step debugging because it is usually cheaper and more cost-efficient than spending the host model's context. The response includes a human-readable answer in content/text plus structuredContent with threadId and content. To continue the same session, call agent-reply with the returned threadId from the prior response. Legacy aliases codex and codex-reply are still accepted for compatibility. For attached guidance, read yolo-codex-mcp://guides/operating-guide.md.",
 				inputSchema: {
 					type: "object",
 					properties: {
@@ -74,17 +91,17 @@ export function createReducedToolsListResult(): ListToolsResult {
 				outputSchema: codexOutputSchema,
 			},
 			{
-				name: "codex-reply",
+				name: primaryOuterToolNames.reply,
 				title: "Smart Cheap Agent Reply",
 				description:
-					"Continue the same Smart Cheap Agent session with proxy-managed policy settings. Pass the threadId returned by codex or a previous codex-reply call to keep the conversation on the same session. The response includes the same shape as codex: a human-readable answer in content/text plus structuredContent with threadId and content. For attached guidance, read yolo-codex-mcp://guides/operating-guide.md.",
+					"Continue the same Smart Cheap Agent session with proxy-managed policy settings. Pass the threadId returned by agent-start or a previous agent-reply call to keep the conversation on the same session. The response includes the same shape as agent-start: a human-readable answer in content/text plus structuredContent with threadId and content. Legacy aliases codex and codex-reply are still accepted for compatibility. For attached guidance, read yolo-codex-mcp://guides/operating-guide.md.",
 				inputSchema: {
 					type: "object",
 					properties: {
 						threadId: {
 							type: "string",
 							description:
-								"The threadId returned by codex or a previous codex-reply call for the same Smart Cheap Agent session.",
+								"The threadId returned by agent-start or a previous agent-reply call for the same Smart Cheap Agent session.",
 						},
 						prompt: {
 							type: "string",
@@ -99,8 +116,21 @@ export function createReducedToolsListResult(): ListToolsResult {
 	});
 }
 
-export function parseOuterCodexCall(argumentsValue: unknown): OuterCodexCall {
-	const args = expectArgumentsObject(argumentsValue, "codex");
+export function normalizeOuterToolName(toolName: string): CanonicalInnerToolName | null {
+	if (toolName === primaryOuterToolNames.start || toolName === legacyOuterToolNames.start) {
+		return "codex";
+	}
+	if (toolName === primaryOuterToolNames.reply || toolName === legacyOuterToolNames.reply) {
+		return "codex-reply";
+	}
+	return null;
+}
+
+export function parseOuterCodexCall(
+	argumentsValue: unknown,
+	toolName: string = primaryOuterToolNames.start,
+): OuterCodexCall {
+	const args = expectArgumentsObject(argumentsValue, toolName);
 	const prompt = expectRequiredString(args.prompt, "prompt");
 	return {
 		prompt,
@@ -110,8 +140,11 @@ export function parseOuterCodexCall(argumentsValue: unknown): OuterCodexCall {
 	};
 }
 
-export function parseOuterCodexReplyCall(argumentsValue: unknown): OuterCodexReplyCall {
-	const args = expectArgumentsObject(argumentsValue, "codex-reply");
+export function parseOuterCodexReplyCall(
+	argumentsValue: unknown,
+	toolName: string = primaryOuterToolNames.reply,
+): OuterCodexReplyCall {
+	const args = expectArgumentsObject(argumentsValue, toolName);
 	const prompt = expectRequiredString(args.prompt, "prompt");
 	const threadId = readOptionalString(args.threadId) ?? readOptionalString(args.conversationId);
 	if (threadId === null) {

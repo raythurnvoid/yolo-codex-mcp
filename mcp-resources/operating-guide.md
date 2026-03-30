@@ -2,15 +2,17 @@
 
 `yolo-codex-mcp` is simple to use:
 
-1. Call `codex` to start a new Smart Cheap Agent session.
+1. Call `agent-start` to start a new Smart Cheap Agent session.
 2. Read `structuredContent.threadId` from the result.
-3. Call `codex-reply` with that same `threadId` for follow-up turns in the same conversation.
+3. Call `agent-reply` with that same `threadId` for follow-up turns in the same conversation.
+
+Legacy aliases `codex` and `codex-reply` are still accepted for compatibility, but `agent-start` and `agent-reply` are the advertised outer tool ids.
 
 Example:
 
 ```json
 {
-	"name": "codex",
+	"name": "agent-start",
 	"arguments": {
 		"prompt": "Debug why the proxy does not preserve cwd on Windows."
 	}
@@ -26,7 +28,7 @@ Follow-up:
 
 ```json
 {
-	"name": "codex-reply",
+	"name": "agent-reply",
 	"arguments": {
 		"threadId": "thr_123",
 		"prompt": "Now propose the smallest patch."
@@ -37,16 +39,16 @@ Follow-up:
 Notes:
 
 - Keep reusing the same `threadId` while you want Smart Cheap Agent to keep the same chat context.
-- `codex-reply` still accepts deprecated `conversationId`, but `threadId` is the preferred field.
+- `agent-reply` still accepts deprecated `conversationId`, but `threadId` is the preferred field.
 - If a caller still passes legacy `cwd`, the wrapper ignores it and chooses `cwd` from client workspace context when available, then `process.cwd()`.
-- Optional `agent-instructions` on `codex` are forwarded to the inner agent as `developer-instructions`.
+- Optional `agent-instructions` on `agent-start` are forwarded to the inner agent as `developer-instructions`.
 
 ## Sessions And Rollouts
 
 Smart Cheap Agent session state is organized around the returned `threadId`.
 
-- The wrapper returns a `threadId` from `codex`.
-- That same `threadId` is what you pass into `codex-reply`.
+- The wrapper returns a `threadId` from `agent-start`.
+- That same `threadId` is what you pass into `agent-reply`.
 - Rollout files usually include the thread id in the filename suffix: `rollout-...-<threadId>.jsonl`.
 
 Under the hood, those sessions still live in the inner Codex session store. By default, the session files live under:
@@ -67,13 +69,13 @@ The current inner Codex layout is date-organized, for example:
 ~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<threadId>.jsonl
 ```
 
-If Smart Cheap Agent stalls after reporting `task_complete`, the wrapper falls back to the rollout files:
+If Smart Cheap Agent stalls after a terminal rollout event, the wrapper falls back to the rollout files:
 
 1. It resolves the sessions root.
 2. It scans recursively for `rollout-*.jsonl`.
 3. If it already knows the `threadId`, it prefers files ending in `-<threadId>.jsonl`.
-4. It reads the last JSONL line and looks for `task_complete` or `turn_complete`.
-5. It synthesizes the final MCP tool result from `last_agent_message`.
+4. It reads the last JSONL line and looks for `task_complete`, `turn_complete`, or `turn_aborted`.
+5. It synthesizes the final MCP tool result from `last_agent_message` for completions, or an interrupted `isError` result for `turn_aborted`.
 
 ## When To Use Smart Cheap Agent
 
@@ -84,4 +86,4 @@ Smart Cheap Agent is the preferred first delegation tool exposed by this wrapper
 - browser-tool workflows
 - long-running investigations that benefit from reusing the same `threadId`
 
-If you expect several rounds of follow-up questions or debugging iterations, keep using `codex-reply` with the same `threadId` instead of starting a fresh Smart Cheap Agent session each time.
+If you expect several rounds of follow-up questions or debugging iterations, keep using `agent-reply` with the same `threadId` instead of starting a fresh Smart Cheap Agent session each time.

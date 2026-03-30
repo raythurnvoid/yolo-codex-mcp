@@ -1,6 +1,6 @@
 # yolo-codex-mcp
 
-`yolo-codex-mcp` is a stdio MCP wrapper around the official Codex MCP server. On the outer MCP surface, it presents the preferred delegation tool as Smart Cheap Agent while preserving the stable wire tool names `codex` and `codex-reply`.
+`yolo-codex-mcp` is a stdio MCP wrapper around the official Codex MCP server. On the outer MCP surface, it presents the preferred delegation tool as Smart Cheap Agent through the advertised tool ids `agent-start` and `agent-reply`.
 
 You run one MCP server: the wrapper. The wrapper then starts and supervises the inner official `codex mcp-server` process for you.
 
@@ -13,13 +13,13 @@ It starts the real inner server with the same shape people already use today:
 }
 ```
 
-The wrapper keeps the outer wire tool names `codex` and `codex-reply`, but simplifies what MCP clients need to send and brands them for users as Smart Cheap Agent and Smart Cheap Agent Reply:
+The wrapper advertises the outer tool ids `agent-start` and `agent-reply`, while still accepting the legacy aliases `codex` and `codex-reply` for compatibility. It simplifies what MCP clients need to send and brands them for users as Smart Cheap Agent and Smart Cheap Agent Reply:
 
-- `codex`: `prompt`, optional `agent-instructions`, optional `compact-prompt`
-- `codex-reply`: `threadId`, `prompt`
+- `agent-start`: `prompt`, optional `agent-instructions`, optional `compact-prompt`
+- `agent-reply`: `threadId`, `prompt`
 - one attached MCP resource with operating guidance
 
-The outer `codex` tool is the preferred first delegation tool for complex, context-heavy work. It is intended to be cheaper and more cost-efficient than spending the host model's context directly, while still giving the delegated agent file editing, web browsing, and user-configured MCP tool access.
+The outer `agent-start` tool is the preferred first delegation tool for complex, context-heavy work. It is intended to be cheaper and more cost-efficient than spending the host model's context directly, while still giving the delegated agent file editing, web browsing, and user-configured MCP tool access.
 
 Everything else is handled by the wrapper with fixed defaults:
 
@@ -29,7 +29,7 @@ Everything else is handled by the wrapper with fixed defaults:
 - `model` / `profile`: not forced by the wrapper, so the inner official server keeps using normal Codex config resolution, including `CODEX_HOME` config and default profile behavior
 - `agent-instructions`: forwarded to the inner official tool as `developer-instructions`
 - inner Codex binary resolution: override env first, then normal PATH lookup, then common Windows install locations and user shims, then WSL on Windows when available
-- completion fallback: if the inner Codex MCP stalls after writing `task_complete` to its rollout JSONL, the wrapper resolves the rollout path, polls the rollout every 5 seconds, logs each poll cycle to `stderr`, and synthesizes the final tool result from the last agent message
+- completion fallback: if the inner Codex MCP stalls after a terminal rollout event, the wrapper resolves the rollout path, polls the rollout every 5 seconds, logs each poll cycle to `stderr`, synthesizes normal completions from `task_complete` / `turn_complete`, and synthesizes an `isError` interrupted result from `turn_aborted`
 
 ## How It Runs
 
@@ -167,33 +167,6 @@ If automatic discovery still misses an unusual Codex install, add `CODEX_MCP_BIN
 }
 ```
 
-### Cursor Hooks For Workspace `cwd`
-
-This repo also ships a project hook at [`.cursor/hooks.json`](/mnt/c/Users/rt0/C:/Users/rt0/Documents/workspace/rt0/yolo-codex-mcp/.cursor/hooks.json) plus [`.cursor/hooks/inject-yolo-cwd.mjs`](/mnt/c/Users/rt0/C:/Users/rt0/Documents/workspace/rt0/yolo-codex-mcp/.cursor/hooks/inject-yolo-cwd.mjs).
-
-Per the current [Cursor Hooks docs](https://cursor.com/docs/hooks):
-
-- all hooks receive `workspace_roots`
-- `preToolUse` can return `updated_input`
-- `beforeMCPExecution` currently documents permission output only, not input mutation
-- `preToolUse` MCP matchers use the `MCP:<tool_name>` format
-
-Because of that, this repo uses a `preToolUse` hook for `MCP:codex` and `MCP:codex-reply`. The hook is diagnostics-only; the wrapper itself handles `cwd` derivation.
-
-Hook behavior:
-
-- if Cursor runs project hooks for this trusted workspace, the hook reads and logs `workspace_roots`
-- it does not inject `cwd`
-- the wrapper is the primary mechanism for `cwd` derivation
-- multi-root workspaces are still best-effort and the wrapper logs when it uses a first-root heuristic
-
-Enablement and trust notes:
-
-- project hooks load from `.cursor/hooks.json` when the workspace is trusted
-- Cursor watches `hooks.json` and reloads it on save
-- hooks execute local code, so review the script before trusting the workspace
-- if you want the same behavior globally instead, copy the files to `~/.cursor/hooks.json` and `~/.cursor/hooks/inject-yolo-cwd.mjs`, then adjust the command path to `node ./hooks/inject-yolo-cwd.mjs`
-
 ### Alternative: Run Through `pnpm`
 
 If you prefer to launch through the package manager instead of calling Node directly:
@@ -255,7 +228,7 @@ Examples:
 The wrapper always emits dedicated `stderr` lines for workspace discovery and per-call cwd choice:
 
 - `[yolo-codex-mcp][client-cwd] ...`: observed client workspace roots, proactive `roots/list` requests, and the current selected client-derived `cwd`
-- `[yolo-codex-mcp][cwd] ...`: the effective `cwd` chosen for each `codex` / `codex-reply` call and why
+- `[yolo-codex-mcp][cwd] ...`: the effective `cwd` chosen for each `agent-start` / `agent-reply` call and why
 - `[yolo-codex-mcp][tools-forward] ...`: the exact forwarded inner tool arguments
 - `[yolo-codex-mcp][cwd-legacy] ...`: any ignored legacy outer `cwd` supplied by the caller
 - `[yolo-codex-mcp][cwd-fallback] ...`: the last-resort `process.cwd()` fallback baseline
@@ -266,11 +239,11 @@ There are no wrapper env vars for logging or working-directory selection.
 
 The wrapper also exposes one attached MCP resource so agents can read usage guidance directly from the server:
 
-- `yolo-codex-mcp://guides/operating-guide.md`: how to use `codex` and `codex-reply`, where sessions and rollout files live, and when to prefer Smart Cheap Agent for long debugging, research, and browser-tool workflows
+- `yolo-codex-mcp://guides/operating-guide.md`: how to use `agent-start` and `agent-reply`, where sessions and rollout files live, and when to prefer Smart Cheap Agent for long debugging, research, and browser-tool workflows
 
 ## Tool Behavior
 
-### `codex`
+### `agent-start`
 
 Shown to users as `Smart Cheap Agent`.
 
@@ -287,14 +260,15 @@ Forwarded to the inner official tool:
 - `compact-prompt` -> `compact-prompt`
 - wrapper also injects fixed `sandbox`, `approval-policy`, and a server-derived `cwd`
 - if a caller still sends `cwd`, the wrapper treats it as legacy-only, logs that it was ignored, and derives `cwd` server-side instead
+- legacy alias `codex` is still accepted for compatibility
 
 Result shape:
 
 - `structuredContent.threadId` is the Smart Cheap Agent session/thread identifier
 - `structuredContent.content` is the latest Smart Cheap Agent message
-- to continue the same session, call `codex-reply` with the same `threadId`
+- to continue the same session, call `agent-reply` with the same `threadId`
 
-### `codex-reply`
+### `agent-reply`
 
 Shown to users as `Smart Cheap Agent Reply`.
 
@@ -306,7 +280,8 @@ Outer input:
 Compatibility note:
 
 - deprecated `conversationId` is still accepted and rewritten to `threadId`
-- in normal usage, pass the `threadId` previously returned by `codex` or a prior `codex-reply`
+- in normal usage, pass the `threadId` previously returned by `agent-start` or a prior `agent-reply`
+- legacy alias `codex-reply` is still accepted for compatibility
 
 ## Troubleshooting
 
@@ -316,7 +291,7 @@ If the wrapper cannot start the inner server, it has already tried automatic dis
 
 ### Wrong Working Directory
 
-The wrapper tracks client workspace context over MCP and derives `cwd` server-side. It watches inbound `initialize`, `workspace/*`, and `roots/*` traffic, and when the client advertises roots support it proactively requests `roots/list` after `notifications/initialized`. The Cursor hook is optional and does not inject `cwd`.
+The wrapper tracks client workspace context over MCP and derives `cwd` server-side. It watches inbound `initialize`, `workspace/*`, and `roots/*` traffic, and when the client advertises roots support it proactively requests `roots/list` after `notifications/initialized`.
 
 Effective `cwd` precedence is:
 
@@ -325,8 +300,6 @@ Effective `cwd` precedence is:
 - `process.cwd()`
 
 The server process location is only the final fallback. On startup the wrapper logs **`[yolo-codex-mcp][cwd-fallback] ...`** to make that fallback explicit.
-
-Cursor hook limitation, verified against the live Hooks docs: `beforeMCPExecution` currently documents `permission`, `user_message`, and `agent_message`, but not `updated_input`. This repo keeps the hook on `preToolUse`, but only for diagnostics; the wrapper does not depend on hook-driven input mutation.
 
 ### Debug Inbound MCP Handshake
 
@@ -351,7 +324,7 @@ Cursor limitation:
 
 ### Inner Codex Hangs After `task_complete`
 
-If the inner Codex MCP writes `task_complete` to its rollout JSONL but never returns the final `tools/call` response, the wrapper falls back to the rollout file. It prefers the `rollout_path` from `session_configured`, and otherwise scans one resolved Codex sessions root for the matching `rollout-*.jsonl` file by thread id or newest recent rollout. On Windows WSL launches, that sessions root is converted up front to a Windows-accessible `\\\\wsl$\\...` path so normal Node filesystem reads can be reused. Every 5 seconds the wrapper logs a poll cycle to `stderr`, reads the last JSONL line, and once it sees `task_complete` it synthesizes the final MCP tool result from `last_agent_message`.
+If the inner Codex MCP reaches a terminal rollout event but never returns the final `tools/call` response, the wrapper falls back to the rollout file. It prefers the `rollout_path` from `session_configured`, and otherwise scans one resolved Codex sessions root for the matching `rollout-*.jsonl` file by thread id or newest recent rollout. On Windows WSL launches, that sessions root is converted up front to a Windows-accessible `\\\\wsl$\\...` path so normal Node filesystem reads can be reused. Every 5 seconds the wrapper logs a poll cycle to `stderr`, reads the last JSONL line, synthesizes the final MCP tool result from `last_agent_message` for `task_complete` / `turn_complete`, and synthesizes an interrupted `isError` result when it sees `turn_aborted`.
 
 ### Smoke Test Is Skipped
 

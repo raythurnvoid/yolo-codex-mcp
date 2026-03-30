@@ -143,15 +143,21 @@ async function onRequest(message: JsonRpcRequest): Promise<void> {
 
 		if (
 			prompt === "stuck-rollout" ||
+			prompt === "stuck-rollout-aborted" ||
 			prompt === "stuck-rollout-delayed-response" ||
-			prompt === "stuck-rollout-session-scan"
+			prompt === "stuck-rollout-session-scan" ||
+			prompt === "turn-aborted-live-delayed-response"
 		) {
 			const threadId =
 				toolName === "codex-reply" && typeof argumentsObject.threadId === "string"
 					? argumentsObject.threadId
 					: prompt === "stuck-rollout-session-scan"
 						? "thr_session_scan"
-						: "thr_stuck_rollout";
+						: prompt === "stuck-rollout-aborted"
+							? "thr_rollout_aborted"
+							: prompt === "turn-aborted-live-delayed-response"
+								? "thr_turn_aborted_live"
+								: "thr_stuck_rollout";
 			const rolloutPath = await createMockRolloutFile(threadId, prompt === "stuck-rollout-session-scan");
 			await write({
 				jsonrpc: "2.0",
@@ -169,6 +175,40 @@ async function onRequest(message: JsonRpcRequest): Promise<void> {
 					},
 				},
 			});
+			if (prompt === "stuck-rollout-aborted") {
+				setTimeout(() => {
+					void appendTurnAbortedEvent(rolloutPath, message.id, threadId, "interrupted");
+				}, 100);
+				return;
+			}
+			if (prompt === "turn-aborted-live-delayed-response") {
+				setTimeout(() => {
+					void write({
+						jsonrpc: "2.0",
+						method: "codex/event",
+						params: {
+							_meta: {
+								requestId: message.id,
+								threadId,
+							},
+							id: "evt-turn-aborted",
+							msg: {
+								type: "turn_aborted",
+								reason: "interrupted",
+								session_id: threadId,
+							},
+						},
+					});
+				}, 100);
+				setTimeout(() => {
+					void write({
+						jsonrpc: "2.0",
+						id: message.id,
+						result: createToolResult(threadId, "late interrupted real response"),
+					});
+				}, 6_000);
+				return;
+			}
 			setTimeout(() => {
 				void appendTaskCompleteEvent(
 					rolloutPath,
@@ -339,6 +379,34 @@ async function appendTaskCompleteEvent(
 				msg: {
 					type: "task_complete",
 					last_agent_message: lastAgentMessage,
+				},
+			},
+		})}\n`,
+		"utf8",
+	);
+}
+
+async function appendTurnAbortedEvent(
+	rolloutPath: string,
+	requestId: JsonRpcId,
+	threadId: string,
+	reason: string,
+): Promise<void> {
+	await appendFile(
+		rolloutPath,
+		`${JSON.stringify({
+			ts: new Date().toISOString(),
+			dir: "to_tui",
+			kind: "codex_event",
+			payload: {
+				_meta: {
+					requestId,
+					threadId,
+				},
+				id: "evt-turn-aborted",
+				msg: {
+					type: "turn_aborted",
+					reason,
 				},
 			},
 		})}\n`,

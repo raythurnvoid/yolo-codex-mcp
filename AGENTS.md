@@ -7,7 +7,7 @@ Use this file for repo-wide operating guidance. If a workflow is specialized or 
 - Purpose: wrap the official Codex MCP server (`codex mcp-server`) as an inner child process and expose a reduced outer MCP tool surface.
 - Runtime entrypoint: `src/server.ts`
 - Built artifact: `dist/server.mjs`
-- Primary tools exposed by the server: `codex`, `codex-reply`
+- Primary tools exposed by the server: `agent-start`, `agent-reply` (with legacy `codex`, `codex-reply` aliases still accepted)
 - Core dependencies: `@modelcontextprotocol/sdk`, `zod`, `vite-plus`
 - Generated output: `dist/`
 - Upstream reference material: `reference-submodules/`
@@ -15,7 +15,7 @@ Use this file for repo-wide operating guidance. If a workflow is specialized or 
 Behavior summary:
 
 - The outer server is a stdio JSON-RPC proxy around the official inner Codex MCP server.
-- It simplifies the tool contract clients see by advertising reduced `codex` / `codex-reply` schemas instead of the full official schema.
+- It simplifies the tool contract clients see by advertising reduced `agent-start` / `agent-reply` schemas instead of the full official schema.
 - It applies fixed, opinionated defaults in proxy code, including sandbox / approval behavior, `cwd` injection from `process.cwd()`, and field mapping such as outer `agent-instructions` to inner `developer-instructions`.
 - The default expectation is that the wrapper auto-resolves the inner Codex binary the way a normal local install would work: explicit overrides first, then PATH, then common Windows install locations / user shims, then WSL on Windows where available.
 - `CODEX_MCP_BIN` and `CODEX_MCP_ARGS` are optional launch overrides, not the primary expected setup.
@@ -106,7 +106,7 @@ Do not do broad stylistic cleanup outside the scope of the task.
 
 - proxy entrypoint and stdio transport setup
 - inner-server launch via `codex mcp-server` by default
-- reduced outer tool schemas for `codex` and `codex-reply`
+- reduced outer tool schemas for `agent-start` and `agent-reply`, with legacy `codex` / `codex-reply` aliases still accepted
 - JSON-RPC request / response / notification forwarding between outer client and inner Codex MCP server
 - fixed outer-to-inner argument rewriting, including `agent-instructions` -> inner `developer-instructions`
 - server-initiated request id remapping for inner requests such as `elicitation/create`
