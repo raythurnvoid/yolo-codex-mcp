@@ -159,11 +159,20 @@ export function parseOuterCodexReplyCall(
 }
 
 export function buildInnerCodexArguments(call: InnerCodexCall, policy: ProxyPolicy) {
+	return buildInnerCodexArgumentsWithBaseInstructions(call, policy, null);
+}
+
+export function buildInnerCodexArgumentsWithBaseInstructions(
+	call: InnerCodexCall,
+	policy: ProxyPolicy,
+	baseDeveloperInstructions: string | null,
+) {
 	const forwarded: Record<string, unknown> = {
 		prompt: call.prompt,
 		sandbox: policy.sandbox,
 		"approval-policy": policy.approvalPolicy,
 	};
+	const developerInstructions = mergeDeveloperInstructions(baseDeveloperInstructions, call.agentInstructions);
 
 	if (policy.model !== null) {
 		forwarded.model = policy.model;
@@ -174,8 +183,8 @@ export function buildInnerCodexArguments(call: InnerCodexCall, policy: ProxyPoli
 	if (call.cwd !== null) {
 		forwarded.cwd = call.cwd;
 	}
-	if (call.agentInstructions !== null) {
-		forwarded["developer-instructions"] = call.agentInstructions;
+	if (developerInstructions !== null) {
+		forwarded["developer-instructions"] = developerInstructions;
 	}
 	if (call.compactPrompt !== null) {
 		forwarded["compact-prompt"] = call.compactPrompt;
@@ -232,4 +241,17 @@ function readOptionalString(value: unknown): string | null {
 	}
 	const trimmed = value.trim();
 	return trimmed ? trimmed : null;
+}
+
+function mergeDeveloperInstructions(
+	baseDeveloperInstructions: string | null,
+	agentInstructions: string | null,
+): string | null {
+	if (baseDeveloperInstructions === null) {
+		return agentInstructions;
+	}
+	if (agentInstructions === null) {
+		return baseDeveloperInstructions;
+	}
+	return `${baseDeveloperInstructions}\n\n${agentInstructions}`;
 }

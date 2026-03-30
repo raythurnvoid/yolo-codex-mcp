@@ -27,7 +27,7 @@ Everything else is handled by the wrapper with fixed defaults:
 - `approval-policy`: `never` (no command approval prompts)
 - `cwd`: derived server-side from the MCP client’s workspace/root context, with `process.cwd()` used only as a last-resort fallback
 - `model` / `profile`: not forced by the wrapper, so the inner official server keeps using normal Codex config resolution, including `CODEX_HOME` config and default profile behavior
-- `agent-instructions`: forwarded to the inner official tool as `developer-instructions`
+- `agent-instructions`: forwarded to the inner official tool as `developer-instructions`, with optional prepended base instructions loaded from `SMART_CHEAP_AGENT_SYSTEM_PROMPT_FILE`
 - thread context normalization: the wrapper injects the Smart Cheap Agent `threadId` into returned tool results directly, so a separate Cursor post-tool hook is not required
 - inner Codex binary resolution: override env first, then normal PATH lookup, then common Windows install locations and user shims, then WSL on Windows when available
 - completion fallback: if the inner Codex MCP stalls after a terminal rollout event, the wrapper resolves the rollout path, polls the rollout every 5 seconds, logs each poll cycle to `stderr`, synthesizes normal completions from `task_complete` / `turn_complete`, and synthesizes an `isError` interrupted result from `turn_aborted`
@@ -132,7 +132,10 @@ Recommended **project-level** setup:
 	"mcpServers": {
 		"codex-yolo": {
 			"command": "node",
-			"args": ["<path-to-repo>/src/server.ts"]
+			"args": ["<path-to-repo>/src/server.ts"],
+			"env": {
+				"SMART_CHEAP_AGENT_SYSTEM_PROMPT_FILE": "C:/Users/<you>/Documents/smart-cheap-agent-system-prompt.md"
+			}
 		}
 	}
 }
@@ -215,6 +218,7 @@ The wrapper supports these environment overrides:
 
 - `CODEX_MCP_BIN`: optional override for the inner Codex command. Default behavior is automatic discovery.
 - `CODEX_MCP_ARGS`: override inner startup args as a JSON array of strings. Default: `["mcp-server"]`
+- `SMART_CHEAP_AGENT_SYSTEM_PROMPT_FILE`: optional absolute path to a UTF-8 `.md` or `.txt` file. When readable, the wrapper prepends that file’s text to the per-call `agent-instructions` before forwarding inner `developer-instructions`. If unset, empty, missing, or unreadable, startup continues without it.
 
 Compatibility note:
 
@@ -231,9 +235,10 @@ The wrapper always emits dedicated `stderr` lines for workspace discovery and pe
 
 - `[yolo-codex-mcp][client-cwd] ...`: observed client workspace roots, proactive `roots/list` requests, and the current selected client-derived `cwd`
 - `[yolo-codex-mcp][cwd] ...`: the effective `cwd` chosen for each `agent-start` / `agent-reply` call and why
-- `[yolo-codex-mcp][tools-forward] ...`: the exact forwarded inner tool arguments
+- `[yolo-codex-mcp][tools-forward] ...`: the exact forwarded inner tool arguments, including the `cwd` written into the inner request
 - `[yolo-codex-mcp][cwd-legacy] ...`: any ignored legacy outer `cwd` supplied by the caller
-- `[yolo-codex-mcp][cwd-fallback] ...`: the last-resort `process.cwd()` fallback baseline
+- `[yolo-codex-mcp][cwd-baseline] ...`: the startup `process.cwd()` baseline before any client workspace is known
+- `[yolo-codex-mcp][cwd-fallback] ...`: an actual tool call that had to fall back to `process.cwd()`
 
 There are no wrapper env vars for logging or working-directory selection.
 
@@ -259,10 +264,39 @@ Forwarded to the inner official tool:
 
 - `prompt` -> `prompt`
 - `agent-instructions` -> `developer-instructions`
+- `SMART_CHEAP_AGENT_SYSTEM_PROMPT_FILE` text -> prepended ahead of `agent-instructions` inside `developer-instructions`
 - `compact-prompt` -> `compact-prompt`
 - wrapper also injects fixed `sandbox`, `approval-policy`, and a server-derived `cwd`
 - if a caller still sends `cwd`, the wrapper treats it as legacy-only, logs that it was ignored, and derives `cwd` server-side instead
 - legacy alias `codex` is still accepted for compatibility
+
+### Hybrid Windows And WSL Grounding
+
+If you want every Smart Cheap Agent session to start with the same Windows/WSL environment guidance, point `SMART_CHEAP_AGENT_SYSTEM_PROMPT_FILE` at a local `.md` or `.txt` file in your Cursor MCP config:
+
+```json
+{
+	"mcpServers": {
+		"codex-yolo": {
+			"command": "node",
+			"args": ["<path-to-repo>/src/server.ts"],
+			"env": {
+				"SMART_CHEAP_AGENT_SYSTEM_PROMPT_FILE": "C:/Users/<you>/Documents/smart-cheap-agent-system-prompt.md"
+			}
+		}
+	}
+}
+```
+
+Example file content:
+
+```md
+This host may mix Windows and WSL.
+
+When the task is inherently Windows, prefer Windows shells and Windows binaries unless the user explicitly asks for WSL. That includes GUI apps, Microsoft Edge, Chrome CDP against Windows loopback, `C:\` paths, `%LOCALAPPDATA%`, and Windows-only executables. Prefer Windows `node.exe`, `curl.exe`, and `msedge.exe` for those tasks.
+
+When the task is WSL-native or depends on Linux-only tooling, use WSL shells, WSL paths, and WSL binaries consistently.
+```
 
 Result shape:
 
@@ -303,11 +337,11 @@ Effective `cwd` precedence is:
 - ignored legacy outer `cwd` is logged but does not win
 - `process.cwd()`
 
-The server process location is only the final fallback. On startup the wrapper logs **`[yolo-codex-mcp][cwd-fallback] ...`** to make that fallback explicit.
+The server process location is only the final fallback. On startup the wrapper logs **`[yolo-codex-mcp][cwd-baseline] ...`** to make that temporary pre-client baseline explicit, and only logs **`[yolo-codex-mcp][cwd-fallback] ...`** when a specific tool call really had to use it.
 
 ### Debug Inbound MCP Handshake
 
-The wrapper logs inbound workspace-relevant MCP traffic all the time. It writes grep-friendly `stderr` lines prefixed with `[yolo-codex-mcp][mcp-in]`, plus `[yolo-codex-mcp][client-cwd]`, `[yolo-codex-mcp][cwd]`, `[yolo-codex-mcp][tools-forward]`, `[yolo-codex-mcp][cwd-legacy]`, and `[yolo-codex-mcp][cwd-fallback]`.
+The wrapper logs inbound workspace-relevant MCP traffic all the time. It writes grep-friendly `stderr` lines prefixed with `[yolo-codex-mcp][mcp-in]`, plus `[yolo-codex-mcp][client-cwd]`, `[yolo-codex-mcp][cwd]`, `[yolo-codex-mcp][tools-forward]`, `[yolo-codex-mcp][cwd-legacy]`, `[yolo-codex-mcp][cwd-baseline]`, and `[yolo-codex-mcp][cwd-fallback]`.
 
 Always-on inbound logging includes:
 

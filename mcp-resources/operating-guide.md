@@ -44,6 +44,7 @@ Notes:
 - `agent-reply` still accepts deprecated `conversationId`, but `threadId` is the preferred field.
 - If a caller still passes legacy `cwd`, the wrapper ignores it and chooses `cwd` from client workspace context when available, then `process.cwd()`.
 - Optional `agent-instructions` on `agent-start` are forwarded to the inner agent as `developer-instructions`.
+- If `SMART_CHEAP_AGENT_SYSTEM_PROMPT_FILE` is configured, that file’s text is prepended to the forwarded `developer-instructions`.
 
 ## Sessions And Rollouts
 

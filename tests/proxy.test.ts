@@ -1,6 +1,6 @@
 import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -263,6 +263,34 @@ void test("agent-start call injects fixed policy and maps agent-instructions", a
 	});
 });
 
+void test("agent-start prepends SMART_CHEAP_AGENT_SYSTEM_PROMPT_FILE to developer instructions", async () => {
+	const tempDir = await mkdtemp(path.join(os.tmpdir(), "yolo-codex-mcp-prompt-"));
+	const promptPath = path.join(tempDir, "smart-cheap-agent-system-prompt.md");
+	await writeFile(promptPath, "Prefer Windows node.exe for Windows GUI tasks.", "utf8");
+
+	const server = await createProxyHarness({
+		SMART_CHEAP_AGENT_SYSTEM_PROMPT_FILE: promptPath,
+	});
+	await server.initialize();
+
+	await server.request("tools/call", {
+		name: "agent-start",
+		arguments: {
+			prompt: "hello",
+			"agent-instructions": "Be terse.",
+		},
+	});
+
+	const forwardedCall = await server.findCapturedRequest("tools/call", "codex");
+	const forwardedRunParams = forwardedCall.params as {
+		arguments: Record<string, unknown>;
+	};
+	assert.equal(
+		forwardedRunParams.arguments["developer-instructions"],
+		"Prefer Windows node.exe for Windows GUI tasks.\n\nBe terse.",
+	);
+});
+
 void test("agent-start backfills thread context into the result without a Cursor hook", async () => {
 	const server = await createProxyHarness();
 	await server.initialize();
@@ -324,6 +352,11 @@ void test("agent-start call derives cwd from inbound workspace notifications", a
 	assert.equal(forwardedRunParams.arguments.cwd, "/tmp/repo");
 
 	const stderr = await server.waitForStderr('"source":"client-derived"');
+	assert.match(stderr, /\[yolo-codex-mcp\]\[client-cwd\].*"event":"selection-changed".*"workspaceVersion":1/);
+	assert.match(
+		stderr,
+		/\[yolo-codex-mcp\]\[client-cwd\].*"event":"selection-changed".*"trigger":"workspace\/didChangeWorkspaceFolders"/,
+	);
 	assert.match(stderr, /\[yolo-codex-mcp\]\[client-cwd\].*"source":"workspace\/didChangeWorkspaceFolders"/);
 	assert.match(stderr, /\[yolo-codex-mcp\]\[cwd\].*"detail":"workspace context only root"/);
 });
@@ -396,9 +429,26 @@ void test("agent-start call derives cwd from proactive roots/list when the clien
 	assert.equal(forwardedRunParams.arguments.cwd, "/tmp/from-roots");
 
 	const stderr = await server.waitForStderr('"reason":"notifications/initialized"');
-	assert.match(stderr, /\[yolo-codex-mcp\]\[client-cwd\].*"method":"roots\/list".*"status":"requesting"/);
+	assert.match(
+		stderr,
+		/\[yolo-codex-mcp\]\[client-cwd\].*"event":"roots-requested".*"method":"roots\/list".*"status":"requesting"/,
+	);
 	assert.match(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"forMethod":"roots\/list"/);
+	assert.match(stderr, /\[yolo-codex-mcp\]\[client-cwd\].*"event":"selection-changed".*"workspaceVersion":1/);
+	assert.match(
+		stderr,
+		/\[yolo-codex-mcp\]\[client-cwd\].*"event":"selection-changed".*"reason":"notifications\/initialized"/,
+	);
+	assert.match(
+		stderr,
+		/\[yolo-codex-mcp\]\[client-cwd\].*"event":"selection-changed".*"to":\{"candidateCount":1,"cwd":"\/tmp\/from-roots".*"source":"client-roots".*"trigger":"roots\/list"/,
+	);
 	assert.match(stderr, /\[yolo-codex-mcp\]\[cwd\].*"detail":"roots\/list only root"/);
+	assert.match(stderr, /\[yolo-codex-mcp\]\[tools-forward\].*"event":"forward-to-inner".*"workspaceVersion":1/);
+	assert.match(
+		stderr,
+		/\[yolo-codex-mcp\]\[tools-forward\].*"cwdSource":"client-roots".*"forwardedCwd":"\/tmp\/from-roots"/,
+	);
 });
 
 void test("agent-start call falls back to process.cwd only when client context is unavailable", async () => {
@@ -420,9 +470,64 @@ void test("agent-start call falls back to process.cwd only when client context i
 	};
 	assert.equal(forwardedRunParams.arguments.cwd, process.cwd());
 
-	const stderr = await server.waitForStderr("No usable client-derived workspace cwd was available");
-	assert.match(stderr, /\[yolo-codex-mcp\]\[cwd-fallback\].*"source":"process\.cwd\(\)"/);
+	const stderr = await server.waitForStderr("[yolo-codex-mcp][cwd-fallback]");
+	assert.match(stderr, /\[yolo-codex-mcp\]\[cwd-baseline\].*"event":"startup-baseline".*"source":"process\.cwd\(\)"/);
+	assert.match(
+		stderr,
+		/\[yolo-codex-mcp\]\[cwd-fallback\].*"event":"tool-call-fallback".*"cwdSource":"process\.cwd\(\)"/,
+	);
 	assert.match(stderr, /\[yolo-codex-mcp\]\[cwd\].*"source":"process\.cwd\(\)"/);
+});
+
+void test("multi-root selection logs heuristic details and forwards the selected cwd metadata", async () => {
+	const server = await createProxyHarness();
+	await server.initialize({
+		capabilities: {
+			roots: {
+				listChanged: true,
+			},
+		},
+	});
+
+	const rootsRequest = await server.readUntilRequest("roots/list");
+	await server.respond(rootsRequest.id, {
+		roots: [
+			{
+				name: "repo-a",
+				uri: "file:///tmp/root-a",
+			},
+			{
+				name: "repo-b",
+				uri: "file:///tmp/root-b",
+			},
+		],
+	});
+
+	await server.request("tools/call", {
+		name: "agent-start",
+		arguments: {
+			prompt: "cwd-from-multi-root",
+		},
+	});
+
+	const forwardedCall = await server.findCapturedRequest("tools/call", "codex");
+	const forwardedRunParams = forwardedCall.params as {
+		arguments: Record<string, unknown>;
+	};
+	assert.equal(forwardedRunParams.arguments.cwd, "/tmp/root-a");
+
+	const stderr = await server.waitForStderr('"heuristic":"first-root"');
+	assert.match(stderr, /\[yolo-codex-mcp\]\[client-cwd\].*"event":"selection-changed".*"workspaceVersion":1/);
+	assert.match(
+		stderr,
+		/\[yolo-codex-mcp\]\[client-cwd\].*"event":"selection-changed".*"level":"warn".*"candidateCount":2.*"heuristic":"first-root"/,
+	);
+	assert.match(stderr, /\[yolo-codex-mcp\]\[cwd\].*"candidateCount":2.*"cwdSource":"client-roots"/);
+	assert.match(stderr, /\[yolo-codex-mcp\]\[tools-forward\].*"workspaceVersion":1/);
+	assert.match(
+		stderr,
+		/\[yolo-codex-mcp\]\[tools-forward\].*"cwdSource":"client-roots".*"forwardedCwd":"\/tmp\/root-a"/,
+	);
 });
 
 void test("agent-reply forwards threadId and supports deprecated conversationId input", async () => {
@@ -788,8 +893,29 @@ void test("loadProxyConfig falls back to CODEX_BIN for compatibility", () => {
 		CODEX_BIN: "C:\\Codex\\codex.exe",
 	});
 
+	assert.equal(config.baseDeveloperInstructions, null);
 	assert.equal(config.innerCommand, "C:\\Codex\\codex.exe");
 	assert.deepEqual(config.innerArgs, ["mcp-server"]);
+});
+
+void test("loadProxyConfig reads SMART_CHEAP_AGENT_SYSTEM_PROMPT_FILE when it is a readable absolute path", async () => {
+	const tempDir = await mkdtemp(path.join(os.tmpdir(), "yolo-codex-mcp-config-"));
+	const promptPath = path.join(tempDir, "smart-cheap-agent-system-prompt.txt");
+	await writeFile(promptPath, "Use Windows shells for Windows-only binaries.\n", "utf8");
+
+	const config = loadProxyConfig({
+		SMART_CHEAP_AGENT_SYSTEM_PROMPT_FILE: promptPath,
+	});
+
+	assert.equal(config.baseDeveloperInstructions, "Use Windows shells for Windows-only binaries.");
+});
+
+void test("loadProxyConfig ignores an unreadable SMART_CHEAP_AGENT_SYSTEM_PROMPT_FILE", () => {
+	const config = loadProxyConfig({
+		SMART_CHEAP_AGENT_SYSTEM_PROMPT_FILE: path.join(os.tmpdir(), "missing-smart-cheap-agent-system-prompt.md"),
+	});
+
+	assert.equal(config.baseDeveloperInstructions, null);
 });
 
 void test("loadProxyConfig ignores removed cwd/debug env vars", () => {

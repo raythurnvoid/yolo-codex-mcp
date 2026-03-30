@@ -25,7 +25,7 @@ import { JsonRpcLineWriter } from "./line_transport.ts";
 import { loadProxyConfig } from "./proxy_config.ts";
 import { createResourcesListResult, createResourcesReadResult } from "./resource_contract.ts";
 import {
-	buildInnerCodexArguments,
+	buildInnerCodexArgumentsWithBaseInstructions,
 	buildInnerCodexReplyArguments,
 	createReducedToolsListResult,
 	createToolCallErrorResult,
@@ -109,6 +109,10 @@ type ClientWorkspaceState = {
 	rootsAdvertised: boolean;
 	rootsEntries: ClientWorkspaceEntry[];
 	rootsRequested: boolean;
+	selectedCwd: string | null;
+	selectedSource: string | null;
+	selectionVersion: number;
+	sessionId: string;
 	workspaceEntries: ClientWorkspaceEntry[];
 };
 
@@ -119,16 +123,45 @@ type ResolvedClientCwd = {
 	source: string;
 };
 
+type LogLevel = "error" | "info" | "warn";
+
 const ROLLOUT_POLL_INTERVAL_MS = 5_000;
+
+function createSessionId(): string {
+	return `s${process.pid.toString(36)}-${Date.now().toString(36)}`;
+}
+
+function createLogPayload(
+	sessionId: string,
+	event: string,
+	level: LogLevel,
+	workspaceVersion: number,
+	payload: Record<string, unknown>,
+): Record<string, unknown> {
+	return {
+		event,
+		level,
+		sessionId,
+		workspaceVersion,
+		...payload,
+	};
+}
+
+function writeTaggedLog(tag: string, payload: Record<string, unknown>): void {
+	process.stderr.write(`[yolo-codex-mcp][${tag}] ${JSON.stringify(payload)}\n`);
+}
 
 export async function runProxyServer(): Promise<void> {
 	const config = loadProxyConfig();
-	process.stderr.write(
-		`[yolo-codex-mcp][cwd-fallback] ${JSON.stringify({
+	const sessionId = createSessionId();
+	writeTaggedLog(
+		"cwd-baseline",
+		createLogPayload(sessionId, "startup-baseline", "info", 0, {
 			cwd: process.cwd(),
 			source: "process.cwd()",
-			warning: "Last-resort fallback only. Expected normal cwd resolution to come from client workspace context.",
-		})}\n`,
+			usedForToolCall: false,
+			warning: "Temporary baseline only. Expected normal cwd resolution to come from client workspace context.",
+		}),
 	);
 	const resolvedLaunch = resolveInnerServerLaunch(config.innerCommand, config.innerArgs);
 	const spawnSpec = createInnerServerSpawnSpec(resolvedLaunch.command, resolvedLaunch.args);
@@ -143,7 +176,7 @@ export async function runProxyServer(): Promise<void> {
 
 	const clientWriter = new JsonRpcLineWriter(process.stdout);
 	const innerWriter = new JsonRpcLineWriter(inner.stdin);
-	const clientWorkspaceState = createClientWorkspaceState();
+	const clientWorkspaceState = createClientWorkspaceState(sessionId);
 	const pendingClientRequests = new Map<string, PendingClientRequest>();
 	const pendingInnerRequests = new Map<string, PendingInnerRequest>();
 	const pendingWorkspaceRequests = new Map<string, PendingWorkspaceRequest>();
@@ -369,13 +402,20 @@ async function onClientMessage(
 			if (pendingWorkspaceRequest.method === "roots/list") {
 				context.clientWorkspaceState.rootsRequested = false;
 			}
-			process.stderr.write(
-				`[yolo-codex-mcp][client-cwd] ${JSON.stringify({
-					error: message.error,
-					method: pendingWorkspaceRequest.method,
-					reason: pendingWorkspaceRequest.reason,
-					status: "error",
-				})}\n`,
+			writeTaggedLog(
+				"client-cwd",
+				createLogPayload(
+					context.clientWorkspaceState.sessionId,
+					"workspace-request-error",
+					"error",
+					context.clientWorkspaceState.selectionVersion,
+					{
+						error: message.error,
+						method: pendingWorkspaceRequest.method,
+						reason: pendingWorkspaceRequest.reason,
+						status: "error",
+					},
+				),
 			);
 			return;
 		}
@@ -420,20 +460,32 @@ async function handleToolsCallRequest(
 		if (toolName === "codex") {
 			const call = parseOuterCodexCall(requestParams.arguments, requestedToolName);
 			if (call.legacyCwd !== null) {
-				logIgnoredLegacyToolCwd(message.id, requestedToolName as OuterToolName, call.legacyCwd);
+				logIgnoredLegacyToolCwd(
+					message.id,
+					requestedToolName as OuterToolName,
+					call.legacyCwd,
+					context.clientWorkspaceState,
+				);
 			}
 			await maybeRequestClientRoots("tools/call", context);
 			const resolvedCwd = resolveToolCallCwd(context.clientWorkspaceState);
 			logToolCallCwdDecision(message.id, requestedToolName as OuterToolName, resolvedCwd, context.clientWorkspaceState);
 			const pendingToolCall = createPendingToolCall(message.id, requestedToolName as OuterToolName);
-			const forwardedArguments = buildInnerCodexArguments(
+			const forwardedArguments = buildInnerCodexArgumentsWithBaseInstructions(
 				{
 					...call,
 					cwd: resolvedCwd.cwd,
 				},
 				context.config.policy,
+				context.config.baseDeveloperInstructions,
 			);
-			logForwardedToolArguments(message.id, requestedToolName as OuterToolName, forwardedArguments);
+			logForwardedToolArguments(
+				message.id,
+				requestedToolName as OuterToolName,
+				forwardedArguments,
+				resolvedCwd,
+				context.clientWorkspaceState,
+			);
 			context.pendingToolCalls.set(jsonRpcIdKey(message.id), pendingToolCall);
 			try {
 				await context.innerWriter.write({
@@ -459,7 +511,12 @@ async function handleToolsCallRequest(
 		if (toolName === "codex-reply") {
 			const call = parseOuterCodexReplyCall(requestParams.arguments, requestedToolName);
 			if (call.legacyCwd !== null) {
-				logIgnoredLegacyToolCwd(message.id, requestedToolName as OuterToolName, call.legacyCwd);
+				logIgnoredLegacyToolCwd(
+					message.id,
+					requestedToolName as OuterToolName,
+					call.legacyCwd,
+					context.clientWorkspaceState,
+				);
 			}
 			await maybeRequestClientRoots("tools/call", context);
 			const resolvedCwd = resolveToolCallCwd(context.clientWorkspaceState);
@@ -472,7 +529,13 @@ async function handleToolsCallRequest(
 				},
 				context.config.policy,
 			);
-			logForwardedToolArguments(message.id, requestedToolName as OuterToolName, forwardedArguments);
+			logForwardedToolArguments(
+				message.id,
+				requestedToolName as OuterToolName,
+				forwardedArguments,
+				resolvedCwd,
+				context.clientWorkspaceState,
+			);
 			context.pendingToolCalls.set(jsonRpcIdKey(message.id), pendingToolCall);
 			try {
 				await context.innerWriter.write({
@@ -614,12 +677,16 @@ function createInitializeResultWithResourcesCapability(result: unknown): unknown
 	};
 }
 
-function createClientWorkspaceState(): ClientWorkspaceState {
+function createClientWorkspaceState(sessionId: string): ClientWorkspaceState {
 	return {
 		initializeEntries: [],
 		rootsAdvertised: false,
 		rootsEntries: [],
 		rootsRequested: false,
+		selectedCwd: null,
+		selectedSource: null,
+		selectionVersion: 0,
+		sessionId,
 		workspaceEntries: [],
 	};
 }
@@ -956,6 +1023,7 @@ function resolveToolCallCwd(state: ClientWorkspaceState): {
 	candidateCount: number;
 	cwd: string;
 	detail: string;
+	selectionSource: string;
 	source: "client-derived" | "process.cwd()";
 	warning: string | null;
 } {
@@ -963,6 +1031,7 @@ function resolveToolCallCwd(state: ClientWorkspaceState): {
 	if (clientDerived !== null) {
 		return {
 			...clientDerived,
+			selectionSource: clientDerived.source,
 			source: "client-derived",
 			warning: null,
 		};
@@ -972,6 +1041,7 @@ function resolveToolCallCwd(state: ClientWorkspaceState): {
 		candidateCount: 0,
 		cwd: process.cwd(),
 		detail: "last-resort process.cwd() fallback",
+		selectionSource: "process.cwd()",
 		source: "process.cwd()",
 		warning: "No usable client-derived workspace cwd was available for this call.",
 	};
@@ -1002,12 +1072,19 @@ async function maybeRequestClientRoots(
 		method: "roots/list",
 		reason,
 	});
-	process.stderr.write(
-		`[yolo-codex-mcp][client-cwd] ${JSON.stringify({
-			method: "roots/list",
-			reason,
-			status: "requesting",
-		})}\n`,
+	writeTaggedLog(
+		"client-cwd",
+		createLogPayload(
+			context.clientWorkspaceState.sessionId,
+			"roots-requested",
+			"info",
+			context.clientWorkspaceState.selectionVersion,
+			{
+				method: "roots/list",
+				reason,
+				status: "requesting",
+			},
+		),
 	);
 	await context.clientWriter.write({
 		id: requestId,
@@ -1029,19 +1106,94 @@ function logObservedClientWorkspaceState(
 	state: ClientWorkspaceState,
 	extra: Record<string, unknown> = {},
 ): void {
+	maybeLogClientCwdSelectionChange(source, state, extra);
 	const selected = resolveClientDerivedCwd(state);
-	process.stderr.write(
-		`[yolo-codex-mcp][client-cwd] ${JSON.stringify({
-			...extra,
-			activeInitialize: summarizeWorkspaceEntries(state.initializeEntries),
-			activeRoots: summarizeWorkspaceEntries(state.rootsEntries),
-			activeWorkspace: summarizeWorkspaceEntries(state.workspaceEntries),
-			heuristic: selected?.candidateCount !== undefined && selected.candidateCount > 1 ? "first-root" : null,
-			selectedCwd: selected?.cwd ?? null,
-			selectedSource: selected?.source ?? null,
-			source,
-		})}\n`,
+	const heuristic = getSelectionHeuristic(selected);
+	writeTaggedLog(
+		"client-cwd",
+		createLogPayload(
+			state.sessionId,
+			"workspace-observed",
+			heuristic === null ? "info" : "warn",
+			state.selectionVersion,
+			{
+				...extra,
+				activeInitialize: summarizeWorkspaceEntries(state.initializeEntries),
+				activeRoots: summarizeWorkspaceEntries(state.rootsEntries),
+				activeWorkspace: summarizeWorkspaceEntries(state.workspaceEntries),
+				candidateCount: selected?.candidateCount ?? 0,
+				heuristic,
+				selectedCwd: selected?.cwd ?? null,
+				selectedSource: selected?.source ?? null,
+				source,
+			},
+		),
 	);
+}
+
+function maybeLogClientCwdSelectionChange(
+	trigger: string,
+	state: ClientWorkspaceState,
+	extra: Record<string, unknown> = {},
+): void {
+	const selected = resolveClientDerivedCwd(state);
+	const nextCwd = selected?.cwd ?? null;
+	const nextSource = selected?.source ?? null;
+	if (state.selectedCwd === nextCwd && state.selectedSource === nextSource) {
+		return;
+	}
+
+	const wasStartupBaseline =
+		state.selectionVersion === 0 && state.selectedCwd === null && state.selectedSource === null;
+	const previous = wasStartupBaseline
+		? {
+				cwd: process.cwd(),
+				kind: "startup-baseline",
+				source: "process.cwd()",
+			}
+		: state.selectedCwd === null && state.selectedSource === null
+			? null
+			: {
+					cwd: state.selectedCwd,
+					kind: "client-derived",
+					source: state.selectedSource,
+				};
+
+	state.selectionVersion += 1;
+	state.selectedCwd = nextCwd;
+	state.selectedSource = nextSource;
+
+	const heuristic = getSelectionHeuristic(selected);
+	writeTaggedLog(
+		"client-cwd",
+		createLogPayload(
+			state.sessionId,
+			"selection-changed",
+			heuristic === null ? "info" : "warn",
+			state.selectionVersion,
+			{
+				...(extra.reason !== undefined ? { reason: extra.reason } : {}),
+				candidateCount: selected?.candidateCount ?? 0,
+				from: previous,
+				heuristic,
+				to:
+					selected === null
+						? null
+						: {
+								candidateCount: selected.candidateCount,
+								cwd: selected.cwd,
+								heuristic,
+								kind: "client-derived",
+								source: selected.source,
+							},
+				trigger,
+			},
+		),
+	);
+}
+
+function getSelectionHeuristic(selected: ResolvedClientCwd | null): string | null {
+	return selected !== null && selected.candidateCount > 1 ? "first-root" : null;
 }
 
 function logToolCallCwdDecision(
@@ -1051,23 +1203,46 @@ function logToolCallCwdDecision(
 		candidateCount: number;
 		cwd: string;
 		detail: string;
+		selectionSource: string;
 		source: "client-derived" | "process.cwd()";
 		warning: string | null;
 	},
 	state: ClientWorkspaceState,
 ): void {
-	process.stderr.write(
-		`[yolo-codex-mcp][cwd] ${JSON.stringify({
-			activeClientRoots: summarizeWorkspaceEntries(state.rootsEntries),
-			activeWorkspaceRoots: summarizeWorkspaceEntries(state.workspaceEntries),
-			candidateCount: resolved.candidateCount,
-			cwd: resolved.cwd,
-			detail: resolved.detail,
-			requestId,
-			source: resolved.source,
-			tool: toolName,
-			warning: resolved.warning,
-		})}\n`,
+	if (resolved.source === "process.cwd()") {
+		writeTaggedLog(
+			"cwd-fallback",
+			createLogPayload(state.sessionId, "tool-call-fallback", "warn", state.selectionVersion, {
+				cwd: resolved.cwd,
+				cwdSource: resolved.selectionSource,
+				detail: resolved.detail,
+				requestId,
+				tool: toolName,
+				warning: resolved.warning,
+			}),
+		);
+	}
+
+	writeTaggedLog(
+		"cwd",
+		createLogPayload(
+			state.sessionId,
+			"tool-call-cwd",
+			resolved.source === "process.cwd()" ? "warn" : "info",
+			state.selectionVersion,
+			{
+				activeClientRoots: summarizeWorkspaceEntries(state.rootsEntries),
+				activeWorkspaceRoots: summarizeWorkspaceEntries(state.workspaceEntries),
+				candidateCount: resolved.candidateCount,
+				cwd: resolved.cwd,
+				cwdSource: resolved.selectionSource,
+				detail: resolved.detail,
+				requestId,
+				source: resolved.source,
+				tool: toolName,
+				warning: resolved.warning,
+			},
+		),
 	);
 }
 
@@ -1075,25 +1250,38 @@ function logForwardedToolArguments(
 	requestId: JsonRpcId,
 	toolName: PendingToolCall["toolName"],
 	argumentsValue: Record<string, unknown>,
+	resolved: {
+		selectionSource: string;
+	},
+	state: ClientWorkspaceState,
 ): void {
-	process.stderr.write(
-		`[yolo-codex-mcp][tools-forward] ${JSON.stringify({
+	writeTaggedLog(
+		"tools-forward",
+		createLogPayload(state.sessionId, "forward-to-inner", "info", state.selectionVersion, {
 			arguments: argumentsValue,
+			cwdSource: resolved.selectionSource,
+			forwardedCwd: readOptionalWorkspaceString(argumentsValue.cwd),
 			requestId,
 			tool: toolName,
-		})}\n`,
+		}),
 	);
 }
 
-function logIgnoredLegacyToolCwd(requestId: JsonRpcId, toolName: PendingToolCall["toolName"], cwd: string): void {
-	process.stderr.write(
-		`[yolo-codex-mcp][cwd-legacy] ${JSON.stringify({
+function logIgnoredLegacyToolCwd(
+	requestId: JsonRpcId,
+	toolName: PendingToolCall["toolName"],
+	cwd: string,
+	state: ClientWorkspaceState,
+): void {
+	writeTaggedLog(
+		"cwd-legacy",
+		createLogPayload(state.sessionId, "ignored-legacy-cwd", "warn", state.selectionVersion, {
 			ignoredCwd: cwd,
 			reason:
 				"Outer tool cwd is legacy-only and ignored. The wrapper derives cwd server-side from client workspace context.",
 			requestId,
 			tool: toolName,
-		})}\n`,
+		}),
 	);
 }
 
