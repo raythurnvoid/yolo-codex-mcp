@@ -1,6 +1,6 @@
 # yolo-codex-mcp
 
-`yolo-codex-mcp` is a stdio MCP wrapper around the official Codex MCP server.
+`yolo-codex-mcp` is a stdio MCP wrapper around the official Codex MCP server. On the outer MCP surface, it presents the preferred delegation tool as Smart Cheap Agent while preserving the stable wire tool names `codex` and `codex-reply`.
 
 You run one MCP server: the wrapper. The wrapper then starts and supervises the inner official `codex mcp-server` process for you.
 
@@ -13,16 +13,19 @@ It starts the real inner server with the same shape people already use today:
 }
 ```
 
-The wrapper keeps the outer tool names `codex` and `codex-reply`, but simplifies what MCP clients need to send:
+The wrapper keeps the outer wire tool names `codex` and `codex-reply`, but simplifies what MCP clients need to send and brands them for users as Smart Cheap Agent and Smart Cheap Agent Reply:
 
-- `codex`: `prompt`, optional `agent-instructions`, optional `compact-prompt`, optional `cwd`
-- `codex-reply`: `threadId`, `prompt`, optional `cwd`
+- `codex`: `prompt`, optional `agent-instructions`, optional `compact-prompt`
+- `codex-reply`: `threadId`, `prompt`
+- one attached MCP resource with operating guidance
+
+The outer `codex` tool is the preferred first delegation tool for complex, context-heavy work. It is intended to be cheaper and more cost-efficient than spending the host model's context directly, while still giving the delegated agent file editing, web browsing, and user-configured MCP tool access.
 
 Everything else is handled by the wrapper with fixed defaults:
 
 - `sandbox`: `danger-full-access` (no Codex filesystem sandbox)
 - `approval-policy`: `never` (no command approval prompts)
-- `cwd`: per-call `cwd` when provided, otherwise `CODEX_MCP_CWD` when set to a non-empty value other than a literal unexpanded `${workspaceFolder}`, otherwise the wrapper process working directory from `process.cwd()`
+- `cwd`: derived server-side from the MCP client’s workspace/root context, with `process.cwd()` used only as a last-resort fallback
 - `model` / `profile`: not forced by the wrapper, so the inner official server keeps using normal Codex config resolution, including `CODEX_HOME` config and default profile behavior
 - `agent-instructions`: forwarded to the inner official tool as `developer-instructions`
 - inner Codex binary resolution: override env first, then normal PATH lookup, then common Windows install locations and user shims, then WSL on Windows when available
@@ -118,30 +121,16 @@ vp fmt <path>
 
 Cursor supports both project-specific `.cursor/mcp.json` and global `~/.cursor/mcp.json`.
 
-#### What Cursor actually documents about substitution
+The wrapper now derives `cwd` server-side from MCP client workspace metadata. Do not configure `cwd` through MCP env vars for normal usage.
 
-Per the [Cursor MCP docs](https://cursor.com/docs/mcp) (**Config interpolation**):
-
-- Substitution is applied to these JSON fields: **`command`**, **`args`**, **`env`**, **`url`**, and **`headers`** — not to other keys unless Cursor extends behavior beyond the docs.
-- **`${workspaceFolder}`** is defined as the folder that contains the **project** `.cursor/mcp.json`. It is not defined relative to **`~/.cursor/mcp.json`**, so placeholders in a **global** MCP file often stay **literal** or behave inconsistently; do not rely on `${workspaceFolder}` there.
-- In practice, some Cursor versions also appear to pass placeholders through unchanged in **`env`** even when you might expect expansion. Confirm with the wrapper’s stderr line **`[yolo-codex-mcp] Raw CODEX_MCP_CWD: ...`** after restart.
-
-**Reliable approaches:**
-
-1. **Per-project** `.cursor/mcp.json` in the repo you are working on, and set **`CODEX_MCP_CWD`** in **`env`** to **`${workspaceFolder}`** _if_ your Cursor build expands it (check the raw log line). If you still see the literal string, use an absolute path for that project.
-2. **Global** `~/.cursor/mcp.json`: use a real **`CODEX_MCP_CWD`** absolute path for the project you care about. This is the safest setup when `${workspaceFolder}` is not expanded there. If you omit it, the wrapper falls back to `process.cwd()` (often the wrapper checkout directory).
-
-Recommended **project-level** setup (try `${workspaceFolder}` in **`env` only**; verify with raw stderr):
+Recommended **project-level** setup:
 
 ```json
 {
 	"mcpServers": {
 		"codex-yolo": {
 			"command": "node",
-			"args": ["<path-to-repo>/src/server.ts"],
-			"env": {
-				"CODEX_MCP_CWD": "${workspaceFolder}"
-			}
+			"args": ["<path-to-repo>/src/server.ts"]
 		}
 	}
 }
@@ -149,23 +138,18 @@ Recommended **project-level** setup (try `${workspaceFolder}` in **`env` only**;
 
 When you adapt this for your own machine, replace `<path-to-repo>` with your own checkout path.
 
-Global config with an explicit absolute path (when placeholders are not expanded):
+Global config:
 
 ```json
 {
 	"mcpServers": {
 		"codex-yolo": {
 			"command": "node",
-			"args": ["<path-to-repo>/src/server.ts"],
-			"env": {
-				"CODEX_MCP_CWD": "C:/Users/<you>/path/to/project"
-			}
+			"args": ["<path-to-repo>/src/server.ts"]
 		}
 	}
 }
 ```
-
-`CODEX_MCP_CWD` is optional. If you omit it, or it is blank, or it is the literal unexpanded `${workspaceFolder}`, the wrapper uses `process.cwd()` and forwards that to the inner Codex server. At startup the wrapper logs both **`[yolo-codex-mcp] Raw CODEX_MCP_CWD: ...`** and **`[yolo-codex-mcp] Resolved Codex working directory: ...`** to `stderr` so you can confirm exactly what Cursor passed and what the inner Codex process will receive.
 
 If automatic discovery still misses an unusual Codex install, add `CODEX_MCP_BIN` in the same `env` block as a fallback:
 
@@ -194,14 +178,14 @@ Per the current [Cursor Hooks docs](https://cursor.com/docs/hooks):
 - `beforeMCPExecution` currently documents permission output only, not input mutation
 - `preToolUse` MCP matchers use the `MCP:<tool_name>` format
 
-Because of that, this repo uses a `preToolUse` hook for `MCP:codex` and `MCP:codex-reply`, not `beforeMCPExecution`.
+Because of that, this repo uses a `preToolUse` hook for `MCP:codex` and `MCP:codex-reply`. The hook is diagnostics-only; the wrapper itself handles `cwd` derivation.
 
 Hook behavior:
 
-- if Cursor runs project hooks for this trusted workspace, the hook reads `workspace_roots[0]`
-- it injects `cwd` only when the outgoing tool payload does not already include a non-empty `cwd`
-- explicit per-call `cwd` still wins
-- multi-root workspaces currently use the first root only
+- if Cursor runs project hooks for this trusted workspace, the hook reads and logs `workspace_roots`
+- it does not inject `cwd`
+- the wrapper is the primary mechanism for `cwd` derivation
+- multi-root workspaces are still best-effort and the wrapper logs when it uses a first-root heuristic
 
 Enablement and trust notes:
 
@@ -256,8 +240,6 @@ The wrapper supports these environment overrides:
 
 - `CODEX_MCP_BIN`: optional override for the inner Codex command. Default behavior is automatic discovery.
 - `CODEX_MCP_ARGS`: override inner startup args as a JSON array of strings. Default: `["mcp-server"]`
-- `CODEX_MCP_CWD`: optional override for the inner Codex working directory. If unset, blank, or the literal unexpanded `${workspaceFolder}`, the wrapper uses `process.cwd()`
-- `CODEX_MCP_DEBUG_INBOUND`: optional diagnostic mode for outer client -> proxy JSON-RPC logging to `stderr`
 
 Compatibility note:
 
@@ -270,45 +252,61 @@ Examples:
 - extensionless Windows path override: `CODEX_MCP_BIN=C:\\Users\\<you>\\bin\\codex` and the wrapper will probe `codex.exe`, `codex.cmd`, then `codex.bat`
 - WSL launch: `CODEX_MCP_BIN=wsl.exe` and `CODEX_MCP_ARGS=["-e","codex","mcp-server"]`
 
-`CODEX_MCP_DEBUG_INBOUND` modes:
+The wrapper always emits dedicated `stderr` lines for workspace discovery and per-call cwd choice:
 
-- `1`, `true`, `yes`, `on`, or `selected`: log the handshake and path-related methods the wrapper already expects: `initialize`, `notifications/initialized`, `roots/*`, `workspace/*`, and `$/...`
-- `unknown`: log only non-whitelisted inbound methods so you can discover extra client traffic without the usual handshake noise
-- `all`: log every inbound request, notification, and response with summarized payloads
-- `verbose`: log every inbound request, notification, and response with full payloads, including `tools/call` arguments
+- `[yolo-codex-mcp][client-cwd] ...`: observed client workspace roots, proactive `roots/list` requests, and the current selected client-derived `cwd`
+- `[yolo-codex-mcp][cwd] ...`: the effective `cwd` chosen for each `codex` / `codex-reply` call and why
+- `[yolo-codex-mcp][tools-forward] ...`: the exact forwarded inner tool arguments
+- `[yolo-codex-mcp][cwd-legacy] ...`: any ignored legacy outer `cwd` supplied by the caller
+- `[yolo-codex-mcp][cwd-fallback] ...`: the last-resort `process.cwd()` fallback baseline
 
-There are no extra wrapper-specific policy env vars. `CODEX_MCP_DEBUG_INBOUND` is diagnostic-only and does not change proxy behavior.
+There are no wrapper env vars for logging or working-directory selection.
+
+## Guidance Resources
+
+The wrapper also exposes one attached MCP resource so agents can read usage guidance directly from the server:
+
+- `yolo-codex-mcp://guides/operating-guide.md`: how to use `codex` and `codex-reply`, where sessions and rollout files live, and when to prefer Smart Cheap Agent for long debugging, research, and browser-tool workflows
 
 ## Tool Behavior
 
 ### `codex`
+
+Shown to users as `Smart Cheap Agent`.
 
 Outer input:
 
 - `prompt` required
 - `agent-instructions` optional
 - `compact-prompt` optional
-- `cwd` optional
 
 Forwarded to the inner official tool:
 
 - `prompt` -> `prompt`
 - `agent-instructions` -> `developer-instructions`
 - `compact-prompt` -> `compact-prompt`
-- `cwd` -> `cwd` when provided
-- wrapper also injects fixed `sandbox` and `approval-policy`, plus fallback `cwd` resolved from `CODEX_MCP_CWD` or `process.cwd()`, with a literal unexpanded `${workspaceFolder}` treated as unset
+- wrapper also injects fixed `sandbox`, `approval-policy`, and a server-derived `cwd`
+- if a caller still sends `cwd`, the wrapper treats it as legacy-only, logs that it was ignored, and derives `cwd` server-side instead
+
+Result shape:
+
+- `structuredContent.threadId` is the Smart Cheap Agent session/thread identifier
+- `structuredContent.content` is the latest Smart Cheap Agent message
+- to continue the same session, call `codex-reply` with the same `threadId`
 
 ### `codex-reply`
+
+Shown to users as `Smart Cheap Agent Reply`.
 
 Outer input:
 
 - `threadId` required
 - `prompt` required
-- `cwd` optional
 
 Compatibility note:
 
 - deprecated `conversationId` is still accepted and rewritten to `threadId`
+- in normal usage, pass the `threadId` previously returned by `codex` or a prior `codex-reply`
 
 ## Troubleshooting
 
@@ -318,33 +316,33 @@ If the wrapper cannot start the inner server, it has already tried automatic dis
 
 ### Wrong Working Directory
 
-The wrapper itself still does not auto-read Cursor `workspace_roots` over MCP and map them to `cwd`. Instead, this repo now ships a Cursor `preToolUse` hook that can inject `workspace_roots[0]` into outgoing `codex` and `codex-reply` tool payloads before execution. If hooks are disabled, the workspace is untrusted, or your Cursor build does not run the project hook, the wrapper falls back to per-call `cwd`, then `CODEX_MCP_CWD`, then `process.cwd()`.
+The wrapper tracks client workspace context over MCP and derives `cwd` server-side. It watches inbound `initialize`, `workspace/*`, and `roots/*` traffic, and when the client advertises roots support it proactively requests `roots/list` after `notifications/initialized`. The Cursor hook is optional and does not inject `cwd`.
 
-In Cursor, keep a **project** `.cursor/mcp.json` with **`CODEX_MCP_CWD`** in **`env`** as the fallback path (see [Cursor MCP interpolation](https://cursor.com/docs/mcp)). The hook is the best-effort workspace-aware override; `CODEX_MCP_CWD` is still the deterministic backup when hooks do not run. The wrapper logs both **`[yolo-codex-mcp] Raw CODEX_MCP_CWD: ...`** and **`[yolo-codex-mcp] Resolved Codex working directory: ...`** at startup so you can see what fallback value it would use.
+Effective `cwd` precedence is:
 
-Cursor hook limitation, verified against the live Hooks docs: `beforeMCPExecution` currently documents `permission`, `user_message`, and `agent_message`, but not `updated_input`, so this repo uses `preToolUse` for mutation. If Cursor later adds MCP input mutation there, this can be revisited.
+- server-derived client workspace `cwd`
+- ignored legacy outer `cwd` is logged but does not win
+- `process.cwd()`
+
+The server process location is only the final fallback. On startup the wrapper logs **`[yolo-codex-mcp][cwd-fallback] ...`** to make that fallback explicit.
+
+Cursor hook limitation, verified against the live Hooks docs: `beforeMCPExecution` currently documents `permission`, `user_message`, and `agent_message`, but not `updated_input`. This repo keeps the hook on `preToolUse`, but only for diagnostics; the wrapper does not depend on hook-driven input mutation.
 
 ### Debug Inbound MCP Handshake
 
-To inspect what Cursor is actually sending to the wrapper, set `CODEX_MCP_DEBUG_INBOUND` in the MCP server `env` block. The wrapper writes grep-friendly `stderr` lines prefixed with `[yolo-codex-mcp][mcp-in]`.
+The wrapper logs inbound workspace-relevant MCP traffic all the time. It writes grep-friendly `stderr` lines prefixed with `[yolo-codex-mcp][mcp-in]`, plus `[yolo-codex-mcp][client-cwd]`, `[yolo-codex-mcp][cwd]`, `[yolo-codex-mcp][tools-forward]`, `[yolo-codex-mcp][cwd-legacy]`, and `[yolo-codex-mcp][cwd-fallback]`.
 
-Recommended modes:
+Always-on inbound logging includes:
 
-- `selected` or `1`: handshake and path-related methods only
-- `unknown`: only methods outside the normal handshake/path whitelist
-- `all`: every inbound method with summarized payloads
-- `verbose`: every inbound method with full payloads, including full `tools/call` arguments
-
-The default `selected` mode logs:
-
-- `initialize` requests, including summarized `params`
+- full `tools/call` payloads
+- `initialize`
 - `notifications/initialized`
 - `roots/*`
 - `workspace/*`
 - `$/...` notifications or requests
-- client responses to server-initiated `roots/*`, `workspace/*`, or `$/...` requests
+- client responses to server-initiated `roots/*`, `workspace/*`, `$/...`, and `elicitation/*` requests
 
-This is intended to answer whether the MCP client supplied workspace roots or similar path context over the wire. If you need to inspect `tools/call` arguments, use `all` or `verbose`.
+This is intended to answer whether the MCP client supplied workspace roots or similar path context over the wire, whether it is still sending a legacy outer `cwd`, and which `cwd` the wrapper chose for each tool call.
 
 Cursor limitation:
 

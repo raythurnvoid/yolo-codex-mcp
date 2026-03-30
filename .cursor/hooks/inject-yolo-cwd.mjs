@@ -4,64 +4,63 @@ import { stderr, stdin, stdout } from "node:process";
 
 const inputText = await readStdin();
 
-let hookInput;
-try {
-	hookInput = JSON.parse(inputText);
-} catch (error) {
-	log(`Failed to parse hook input JSON: ${formatError(error)}`);
+const hookInput = parseJsonObject(inputText);
+if (hookInput === null) {
+	log("Failed to parse hook input JSON from stdin; allowing tool call without cwd injection.");
 	writeOutput({
 		permission: "allow",
 	});
 	process.exit(0);
 }
 
-const workspaceRoots = Array.isArray(hookInput?.workspace_roots)
-	? hookInput.workspace_roots.filter((value) => typeof value === "string" && value.trim() !== "")
-	: [];
-const workspaceCwd = workspaceRoots[0]?.trim() ?? null;
+const workspaceRoots = readWorkspaceRoots(hookInput.workspace_roots);
 const toolName = typeof hookInput?.tool_name === "string" ? hookInput.tool_name.trim() : "";
 const normalizedToolName = toolName.startsWith("MCP:") ? toolName.slice(4) : toolName;
+const toolInput = parseJsonObject(hookInput?.tool_input);
 
-if (workspaceRoots.length > 1) {
-	log(`Multiple workspace roots detected; using the first root for cwd injection: ${workspaceCwd ?? "<none>"}`);
-}
-
-if (!isSupportedTool(normalizedToolName) || workspaceCwd === null) {
-	writeOutput({
-		permission: "allow",
-	});
-	process.exit(0);
-}
-
-const toolInput = parseToolInput(hookInput?.tool_input);
-if (toolInput === null) {
-	log(`Skipping cwd injection for ${toolName || "<unknown>"} because tool_input was not a JSON object.`);
-	writeOutput({
-		permission: "allow",
-	});
-	process.exit(0);
-}
-
-if (hasNonEmptyString(toolInput.cwd)) {
-	writeOutput({
-		permission: "allow",
-	});
-	process.exit(0);
+if (isSupportedTool(normalizedToolName)) {
+	log(
+		JSON.stringify({
+			legacyToolCwd: hasNonEmptyString(toolInput?.cwd) ? toolInput.cwd : null,
+			tool: normalizedToolName,
+			warning: "Hook no longer injects cwd. The wrapper derives cwd server-side from MCP client workspace context.",
+			workspaceRoots,
+		}),
+	);
 }
 
 writeOutput({
 	permission: "allow",
-	updated_input: {
-		...toolInput,
-		cwd: workspaceCwd,
-	},
 });
 
 function isSupportedTool(toolName) {
 	return toolName === "codex" || toolName === "codex-reply";
 }
 
-function parseToolInput(value) {
+function readWorkspaceRoots(value) {
+	if (!Array.isArray(value)) {
+		return [];
+	}
+
+	return value
+		.map((entry) => {
+			if (typeof entry === "string") {
+				return entry.trim();
+			}
+			if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+				if (typeof entry.path === "string") {
+					return entry.path.trim();
+				}
+				if (typeof entry.uri === "string") {
+					return entry.uri.trim();
+				}
+			}
+			return "";
+		})
+		.filter(Boolean);
+}
+
+function parseJsonObject(value) {
 	if (value && typeof value === "object" && !Array.isArray(value)) {
 		return value;
 	}
@@ -69,13 +68,76 @@ function parseToolInput(value) {
 		return null;
 	}
 
-	try {
-		const parsed = JSON.parse(value);
-		return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
-	} catch (error) {
-		log(`Failed to parse string tool_input JSON: ${formatError(error)}`);
+	const trimmed = value.trim();
+	if (!trimmed) {
 		return null;
 	}
+
+	for (const candidate of collectJsonCandidates(trimmed)) {
+		const parsed = parseNestedJson(candidate);
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			return parsed;
+		}
+	}
+
+	return null;
+}
+
+function collectJsonCandidates(text) {
+	const candidates = [text];
+	if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+		candidates.push(text.slice(1, -1));
+	}
+
+	const firstObject = text.indexOf("{");
+	const lastObject = text.lastIndexOf("}");
+	if (firstObject >= 0 && lastObject > firstObject) {
+		candidates.push(text.slice(firstObject, lastObject + 1));
+	}
+
+	return [...new Set(candidates.map((candidate) => candidate.trim()).filter(Boolean))];
+}
+
+function parseNestedJson(text) {
+	let current = text;
+	for (let depth = 0; depth < 3; depth += 1) {
+		if (current && typeof current === "object") {
+			return current;
+		}
+		if (typeof current !== "string") {
+			return null;
+		}
+		const trimmed = current.trim();
+		if (!trimmed) {
+			return null;
+		}
+
+		try {
+			current = JSON.parse(trimmed);
+			continue;
+		} catch (error) {
+			const strippedQuotedObject = stripQuotedObject(trimmed);
+			if (strippedQuotedObject !== null) {
+				current = strippedQuotedObject;
+				continue;
+			}
+			log(`Failed to parse JSON candidate: ${formatError(error)}`);
+			return null;
+		}
+	}
+
+	return current && typeof current === "object" && !Array.isArray(current) ? current : null;
+}
+
+function stripQuotedObject(text) {
+	if (!(text.startsWith('"') && text.endsWith('"'))) {
+		return null;
+	}
+	const inner = text.slice(1, -1).trim();
+	if ((inner.startsWith("{") && inner.endsWith("}")) || (inner.startsWith("[") && inner.endsWith("]"))) {
+		return inner;
+	}
+	return null;
 }
 
 function hasNonEmptyString(value) {

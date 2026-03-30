@@ -8,6 +8,7 @@ import { once } from "node:events";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 
 import {
+	createJsonRpcError,
 	createJsonRpcResponse,
 	isJsonRpcError,
 	isJsonRpcNotification,
@@ -21,7 +22,8 @@ import {
 	type JsonRpcRequest,
 } from "./jsonrpc.ts";
 import { JsonRpcLineWriter } from "./line_transport.ts";
-import { loadProxyConfig, type DebugInboundMode } from "./proxy_config.ts";
+import { loadProxyConfig } from "./proxy_config.ts";
+import { createResourcesListResult, createResourcesReadResult } from "./resource_contract.ts";
 import {
 	buildInnerCodexArguments,
 	buildInnerCodexReplyArguments,
@@ -34,6 +36,15 @@ import {
 type PendingInnerRequest = {
 	innerId: JsonRpcId;
 	method: string;
+};
+
+type PendingClientRequest = {
+	method: string;
+};
+
+type PendingWorkspaceRequest = {
+	method: "roots/list";
+	reason: string;
 };
 
 type PendingToolCall = {
@@ -79,12 +90,39 @@ type WslSessionsRoot = {
 	sessionsRoot: string;
 };
 
+type ClientWorkspaceEntry = {
+	name: string | null;
+	path: string | null;
+	source: string;
+	uri: string | null;
+};
+
+type ClientWorkspaceState = {
+	initializeEntries: ClientWorkspaceEntry[];
+	rootsAdvertised: boolean;
+	rootsEntries: ClientWorkspaceEntry[];
+	rootsRequested: boolean;
+	workspaceEntries: ClientWorkspaceEntry[];
+};
+
+type ResolvedClientCwd = {
+	candidateCount: number;
+	cwd: string;
+	detail: string;
+	source: string;
+};
+
 const ROLLOUT_POLL_INTERVAL_MS = 5_000;
 
 export async function runProxyServer(): Promise<void> {
 	const config = loadProxyConfig();
-	process.stderr.write(`[yolo-codex-mcp] Raw CODEX_MCP_CWD: ${formatLoggedEnvValue(process.env.CODEX_MCP_CWD)}\n`);
-	process.stderr.write(`[yolo-codex-mcp] Resolved Codex working directory: ${config.policy.cwd}\n`);
+	process.stderr.write(
+		`[yolo-codex-mcp][cwd-fallback] ${JSON.stringify({
+			cwd: process.cwd(),
+			source: "process.cwd()",
+			warning: "Last-resort fallback only. Expected normal cwd resolution to come from client workspace context.",
+		})}\n`,
+	);
 	const resolvedLaunch = resolveInnerServerLaunch(config.innerCommand, config.innerArgs);
 	const spawnSpec = createInnerServerSpawnSpec(resolvedLaunch.command, resolvedLaunch.args);
 	const sessionRoot = resolveSessionRoot(spawnSpec, process.env);
@@ -98,7 +136,10 @@ export async function runProxyServer(): Promise<void> {
 
 	const clientWriter = new JsonRpcLineWriter(process.stdout);
 	const innerWriter = new JsonRpcLineWriter(inner.stdin);
+	const clientWorkspaceState = createClientWorkspaceState();
+	const pendingClientRequests = new Map<string, PendingClientRequest>();
 	const pendingInnerRequests = new Map<string, PendingInnerRequest>();
+	const pendingWorkspaceRequests = new Map<string, PendingWorkspaceRequest>();
 	const pendingToolCalls = new Map<string, PendingToolCall>();
 	let nextOuterServerRequestId = 0;
 	let softKillTimer: NodeJS.Timeout | null = null;
@@ -122,10 +163,14 @@ export async function runProxyServer(): Promise<void> {
 	const clientReader = attachLineReader(process.stdin, (line) => {
 		void handleLine(line, async (message) => {
 			await onClientMessage(message, {
+				allocateOuterServerRequestId: () => `proxy:${++nextOuterServerRequestId}`,
+				clientWorkspaceState,
 				clientWriter,
 				config,
 				innerWriter,
+				pendingClientRequests,
 				pendingInnerRequests,
+				pendingWorkspaceRequests,
 				pendingToolCalls,
 				sessionRoot,
 			});
@@ -135,6 +180,7 @@ export async function runProxyServer(): Promise<void> {
 		void handleLine(line, async (message) => {
 			await onInnerMessage(message, {
 				clientWriter,
+				pendingClientRequests,
 				pendingToolCalls,
 				pendingInnerRequests,
 				allocateOuterServerRequestId: () => `proxy:${++nextOuterServerRequestId}`,
@@ -235,17 +281,20 @@ export async function runProxyServer(): Promise<void> {
 async function onClientMessage(
 	message: JsonRpcMessage,
 	context: {
+		allocateOuterServerRequestId: () => JsonRpcId;
+		clientWorkspaceState: ClientWorkspaceState;
 		clientWriter: JsonRpcLineWriter;
 		config: ReturnType<typeof loadProxyConfig>;
 		innerWriter: JsonRpcLineWriter;
+		pendingClientRequests: Map<string, PendingClientRequest>;
 		pendingInnerRequests: Map<string, PendingInnerRequest>;
+		pendingWorkspaceRequests: Map<string, PendingWorkspaceRequest>;
 		pendingToolCalls: Map<string, PendingToolCall>;
 		sessionRoot: ResolvedSessionRoot | null;
 	},
 ): Promise<void> {
-	if (context.config.debugInbound !== "off") {
-		logInboundClientMessage(message, context.pendingInnerRequests, context.config.debugInbound);
-	}
+	observeClientWorkspaceMessage(message, context.clientWorkspaceState, context.pendingInnerRequests);
+	logInboundClientMessage(message, context.pendingInnerRequests, context.pendingWorkspaceRequests);
 
 	if (isJsonRpcRequest(message)) {
 		if (message.method === "tools/list") {
@@ -257,10 +306,43 @@ async function onClientMessage(
 			await handleToolsCallRequest(message, context);
 			return;
 		}
+
+		if (message.method === "resources/list") {
+			await context.clientWriter.write(createJsonRpcResponse(message.id, createResourcesListResult()));
+			return;
+		}
+
+		if (message.method === "resources/read") {
+			await handleResourcesReadRequest(message, context.clientWriter);
+			return;
+		}
+
+		const key = jsonRpcIdKey(message.id);
+		context.pendingClientRequests.set(key, {
+			method: message.method,
+		});
+		try {
+			await context.innerWriter.write(message);
+		} catch (error) {
+			context.pendingClientRequests.delete(key);
+			throw error;
+		}
+		return;
+	}
+
+	if (isJsonRpcNotification(message) && message.method === "notifications/initialized") {
+		await maybeRequestClientRoots("notifications/initialized", context);
 	}
 
 	if (isJsonRpcResponse(message)) {
 		const key = jsonRpcIdKey(message.id);
+		const pendingWorkspaceRequest = context.pendingWorkspaceRequests.get(key);
+		if (pendingWorkspaceRequest) {
+			context.pendingWorkspaceRequests.delete(key);
+			observeWorkspaceRequestResult(message.result, context.clientWorkspaceState, pendingWorkspaceRequest.method);
+			logWorkspaceRequestCompletion(pendingWorkspaceRequest, context.clientWorkspaceState);
+			return;
+		}
 		const pendingRequest = context.pendingInnerRequests.get(key);
 		if (pendingRequest) {
 			context.pendingInnerRequests.delete(key);
@@ -272,16 +354,39 @@ async function onClientMessage(
 		}
 	}
 
+	if (isJsonRpcError(message)) {
+		const key = jsonRpcIdKey(message.id);
+		const pendingWorkspaceRequest = context.pendingWorkspaceRequests.get(key);
+		if (pendingWorkspaceRequest) {
+			context.pendingWorkspaceRequests.delete(key);
+			if (pendingWorkspaceRequest.method === "roots/list") {
+				context.clientWorkspaceState.rootsRequested = false;
+			}
+			process.stderr.write(
+				`[yolo-codex-mcp][client-cwd] ${JSON.stringify({
+					error: message.error,
+					method: pendingWorkspaceRequest.method,
+					reason: pendingWorkspaceRequest.reason,
+					status: "error",
+				})}\n`,
+			);
+			return;
+		}
+	}
+
 	await context.innerWriter.write(message);
 }
 
 async function handleToolsCallRequest(
 	message: JsonRpcRequest,
 	context: {
+		clientWorkspaceState: ClientWorkspaceState;
 		clientWriter: JsonRpcLineWriter;
 		config: ReturnType<typeof loadProxyConfig>;
 		innerWriter: JsonRpcLineWriter;
+		allocateOuterServerRequestId: () => JsonRpcId;
 		pendingInnerRequests: Map<string, PendingInnerRequest>;
+		pendingWorkspaceRequests: Map<string, PendingWorkspaceRequest>;
 		pendingToolCalls: Map<string, PendingToolCall>;
 		sessionRoot: ResolvedSessionRoot | null;
 	},
@@ -306,7 +411,21 @@ async function handleToolsCallRequest(
 	try {
 		if (toolName === "codex") {
 			const call = parseOuterCodexCall(requestParams.arguments);
+			if (call.legacyCwd !== null) {
+				logIgnoredLegacyToolCwd(message.id, "codex", call.legacyCwd);
+			}
+			await maybeRequestClientRoots("tools/call", context);
+			const resolvedCwd = resolveToolCallCwd(context.clientWorkspaceState);
+			logToolCallCwdDecision(message.id, "codex", resolvedCwd, context.clientWorkspaceState);
 			const pendingToolCall = createPendingToolCall(message.id, "codex");
+			const forwardedArguments = buildInnerCodexArguments(
+				{
+					...call,
+					cwd: resolvedCwd.cwd,
+				},
+				context.config.policy,
+			);
+			logForwardedToolArguments(message.id, "codex", forwardedArguments);
 			context.pendingToolCalls.set(jsonRpcIdKey(message.id), pendingToolCall);
 			try {
 				await context.innerWriter.write({
@@ -314,7 +433,7 @@ async function handleToolsCallRequest(
 					params: {
 						...requestParams,
 						name: "codex",
-						arguments: buildInnerCodexArguments(call, context.config.policy),
+						arguments: forwardedArguments,
 					},
 				});
 			} catch (error) {
@@ -331,7 +450,21 @@ async function handleToolsCallRequest(
 
 		if (toolName === "codex-reply") {
 			const call = parseOuterCodexReplyCall(requestParams.arguments);
+			if (call.legacyCwd !== null) {
+				logIgnoredLegacyToolCwd(message.id, "codex-reply", call.legacyCwd);
+			}
+			await maybeRequestClientRoots("tools/call", context);
+			const resolvedCwd = resolveToolCallCwd(context.clientWorkspaceState);
+			logToolCallCwdDecision(message.id, "codex-reply", resolvedCwd, context.clientWorkspaceState);
 			const pendingToolCall = createPendingToolCall(message.id, "codex-reply", call.threadId);
+			const forwardedArguments = buildInnerCodexReplyArguments(
+				{
+					...call,
+					cwd: resolvedCwd.cwd,
+				},
+				context.config.policy,
+			);
+			logForwardedToolArguments(message.id, "codex-reply", forwardedArguments);
 			context.pendingToolCalls.set(jsonRpcIdKey(message.id), pendingToolCall);
 			try {
 				await context.innerWriter.write({
@@ -339,7 +472,7 @@ async function handleToolsCallRequest(
 					params: {
 						...requestParams,
 						name: "codex-reply",
-						arguments: buildInnerCodexReplyArguments(call, context.config.policy),
+						arguments: forwardedArguments,
 					},
 				});
 			} catch (error) {
@@ -362,11 +495,35 @@ async function handleToolsCallRequest(
 	await context.innerWriter.write(message);
 }
 
+async function handleResourcesReadRequest(message: JsonRpcRequest, clientWriter: JsonRpcLineWriter): Promise<void> {
+	if (!isRecord(message.params)) {
+		await clientWriter.write(createJsonRpcError(message.id, -32602, "Expected resources/read params to be an object"));
+		return;
+	}
+
+	const uri = typeof message.params.uri === "string" ? message.params.uri.trim() : "";
+	if (!uri) {
+		await clientWriter.write(
+			createJsonRpcError(message.id, -32602, "Expected resources/read params.uri to be a string"),
+		);
+		return;
+	}
+
+	const result = await createResourcesReadResult(uri);
+	if (result === null) {
+		await clientWriter.write(createJsonRpcError(message.id, -32602, `Unknown resource URI: ${uri}`));
+		return;
+	}
+
+	await clientWriter.write(createJsonRpcResponse(message.id, result));
+}
+
 async function onInnerMessage(
 	message: JsonRpcMessage,
 	context: {
 		allocateOuterServerRequestId: () => JsonRpcId;
 		clientWriter: JsonRpcLineWriter;
+		pendingClientRequests: Map<string, PendingClientRequest>;
 		pendingInnerRequests: Map<string, PendingInnerRequest>;
 		pendingToolCalls: Map<string, PendingToolCall>;
 		sessionRoot: ResolvedSessionRoot | null;
@@ -392,6 +549,11 @@ async function onInnerMessage(
 	}
 
 	if (isJsonRpcResponse(message) || isJsonRpcError(message)) {
+		const clientRequest = context.pendingClientRequests.get(jsonRpcIdKey(message.id)) ?? null;
+		if (clientRequest !== null) {
+			context.pendingClientRequests.delete(jsonRpcIdKey(message.id));
+		}
+
 		const pendingToolCall = context.pendingToolCalls.get(jsonRpcIdKey(message.id));
 		if (pendingToolCall) {
 			if (pendingToolCall.syntheticCompletionSent) {
@@ -400,8 +562,524 @@ async function onInnerMessage(
 			}
 			finishPendingToolCall(pendingToolCall, context.pendingToolCalls);
 		}
+
+		if (clientRequest?.method === "initialize" && isJsonRpcResponse(message)) {
+			await context.clientWriter.write({
+				...message,
+				result: createInitializeResultWithResourcesCapability(message.result),
+			});
+			return;
+		}
+
 		await context.clientWriter.write(message);
 	}
+}
+
+function createInitializeResultWithResourcesCapability(result: unknown): unknown {
+	if (!isRecord(result)) {
+		return result;
+	}
+
+	const capabilities = isRecord(result.capabilities) ? result.capabilities : {};
+	return {
+		...result,
+		capabilities: {
+			...capabilities,
+			resources: isRecord(capabilities.resources) ? capabilities.resources : {},
+		},
+	};
+}
+
+function createClientWorkspaceState(): ClientWorkspaceState {
+	return {
+		initializeEntries: [],
+		rootsAdvertised: false,
+		rootsEntries: [],
+		rootsRequested: false,
+		workspaceEntries: [],
+	};
+}
+
+function observeClientWorkspaceMessage(
+	message: JsonRpcMessage,
+	state: ClientWorkspaceState,
+	pendingInnerRequests: Map<string, PendingInnerRequest>,
+): void {
+	if (isJsonRpcRequest(message) && message.method === "initialize") {
+		state.rootsAdvertised = detectClientRootsSupport(message.params);
+		replaceWorkspaceEntries(state, "initializeEntries", extractClientWorkspaceEntries(message.params, "initialize"));
+		logObservedClientWorkspaceState("initialize", state, {
+			rootsAdvertised: state.rootsAdvertised,
+		});
+		return;
+	}
+
+	if (isJsonRpcRequest(message) || isJsonRpcNotification(message)) {
+		if (message.method === "workspace/didChangeWorkspaceFolders") {
+			const change = extractWorkspaceFolderChange(message.params, message.method);
+			if (change.added.length === 0 && change.removed.length === 0) {
+				return;
+			}
+			state.workspaceEntries = applyWorkspaceFolderChange(state.workspaceEntries, change.added, change.removed);
+			logObservedClientWorkspaceState(message.method, state, {
+				added: summarizeWorkspaceEntries(change.added),
+				removed: summarizeWorkspaceEntries(change.removed),
+			});
+			return;
+		}
+
+		if (message.method.startsWith("workspace/")) {
+			const entries = extractClientWorkspaceEntries(message.params, message.method);
+			if (entries.length === 0) {
+				return;
+			}
+			replaceWorkspaceEntries(state, "workspaceEntries", entries);
+			logObservedClientWorkspaceState(message.method, state);
+			return;
+		}
+	}
+
+	if (!isJsonRpcResponse(message)) {
+		return;
+	}
+
+	const pendingRequest = pendingInnerRequests.get(jsonRpcIdKey(message.id));
+	if (!pendingRequest) {
+		return;
+	}
+
+	if (pendingRequest.method === "roots/list") {
+		observeWorkspaceRequestResult(message.result, state, pendingRequest.method);
+		logObservedClientWorkspaceState(pendingRequest.method, state);
+		return;
+	}
+
+	if (pendingRequest.method.startsWith("workspace/")) {
+		const entries = extractClientWorkspaceEntries(message.result, pendingRequest.method);
+		if (entries.length === 0) {
+			return;
+		}
+		replaceWorkspaceEntries(state, "workspaceEntries", entries);
+		logObservedClientWorkspaceState(pendingRequest.method, state);
+	}
+}
+
+function observeWorkspaceRequestResult(
+	result: unknown,
+	state: ClientWorkspaceState,
+	source: string,
+): ClientWorkspaceEntry[] {
+	const entries = extractClientWorkspaceEntries(result, source);
+	if (source === "roots/list") {
+		replaceWorkspaceEntries(state, "rootsEntries", entries);
+	}
+	return entries;
+}
+
+function replaceWorkspaceEntries(
+	state: ClientWorkspaceState,
+	key: "initializeEntries" | "rootsEntries" | "workspaceEntries",
+	entries: ClientWorkspaceEntry[],
+): void {
+	state[key] = dedupeWorkspaceEntries(entries);
+}
+
+function applyWorkspaceFolderChange(
+	currentEntries: ClientWorkspaceEntry[],
+	addedEntries: ClientWorkspaceEntry[],
+	removedEntries: ClientWorkspaceEntry[],
+): ClientWorkspaceEntry[] {
+	const nextEntries = [...currentEntries];
+	for (const removedEntry of removedEntries) {
+		for (let index = nextEntries.length - 1; index >= 0; index -= 1) {
+			if (workspaceEntriesMatch(nextEntries[index], removedEntry)) {
+				nextEntries.splice(index, 1);
+			}
+		}
+	}
+	return dedupeWorkspaceEntries([...nextEntries, ...addedEntries]);
+}
+
+function workspaceEntriesMatch(left: ClientWorkspaceEntry, right: ClientWorkspaceEntry): boolean {
+	if (left.uri !== null && right.uri !== null) {
+		return left.uri === right.uri;
+	}
+	if (left.path !== null && right.path !== null) {
+		return left.path === right.path;
+	}
+	return false;
+}
+
+function dedupeWorkspaceEntries(entries: ClientWorkspaceEntry[]): ClientWorkspaceEntry[] {
+	const deduped: ClientWorkspaceEntry[] = [];
+	const seen = new Set<string>();
+	for (const entry of entries) {
+		const key = `${entry.uri ?? ""}\u0000${entry.path ?? ""}\u0000${entry.name ?? ""}`;
+		if (seen.has(key)) {
+			continue;
+		}
+		seen.add(key);
+		deduped.push(entry);
+	}
+	return deduped;
+}
+
+function detectClientRootsSupport(value: unknown): boolean {
+	if (!isRecord(value)) {
+		return false;
+	}
+	if (!isRecord(value.capabilities)) {
+		return false;
+	}
+	return isRecord(value.capabilities.roots);
+}
+
+function extractWorkspaceFolderChange(
+	value: unknown,
+	source: string,
+): {
+	added: ClientWorkspaceEntry[];
+	removed: ClientWorkspaceEntry[];
+} {
+	if (!isRecord(value) || !isRecord(value.event)) {
+		return {
+			added: [],
+			removed: [],
+		};
+	}
+
+	return {
+		added: extractClientWorkspaceEntries(value.event.added, `${source}:added`),
+		removed: extractClientWorkspaceEntries(value.event.removed, `${source}:removed`),
+	};
+}
+
+function extractClientWorkspaceEntries(value: unknown, source: string): ClientWorkspaceEntry[] {
+	const entries: ClientWorkspaceEntry[] = [];
+	const seenObjects = new Set<unknown>();
+
+	const visit = (node: unknown, key: string | null = null, inheritedName: string | null = null) => {
+		if (Array.isArray(node)) {
+			for (const entry of node) {
+				visit(entry, key, inheritedName);
+			}
+			return;
+		}
+
+		if (isRecord(node)) {
+			if (seenObjects.has(node)) {
+				return;
+			}
+			seenObjects.add(node);
+			const name = readOptionalWorkspaceString(node.name) ?? inheritedName;
+			const uri =
+				readOptionalWorkspaceString(node.uri) ??
+				readOptionalWorkspaceString(node.rootUri) ??
+				readOptionalWorkspaceString(node.root_uri) ??
+				readOptionalWorkspaceString(node.url);
+			const rawPath =
+				readOptionalWorkspaceString(node.path) ??
+				readOptionalWorkspaceString(node.rootPath) ??
+				readOptionalWorkspaceString(node.root_path) ??
+				readOptionalWorkspaceString(node.cwd) ??
+				readOptionalWorkspaceString(node.workspacePath) ??
+				readOptionalWorkspaceString(node.workspaceRoot);
+
+			if (uri !== null || rawPath !== null) {
+				entries.push({
+					name,
+					path: uri !== null ? (fileUriToFilesystemPath(uri) ?? rawPath) : rawPath,
+					source,
+					uri,
+				});
+			}
+
+			for (const [childKey, childValue] of Object.entries(node)) {
+				visit(childValue, childKey, name);
+			}
+			return;
+		}
+
+		if (typeof node !== "string") {
+			return;
+		}
+
+		const trimmed = node.trim();
+		if (!trimmed) {
+			return;
+		}
+
+		if (looksLikeWorkspaceUriKey(key) && trimmed.startsWith("file:")) {
+			entries.push({
+				name: inheritedName,
+				path: fileUriToFilesystemPath(trimmed),
+				source,
+				uri: trimmed,
+			});
+			return;
+		}
+
+		if (looksLikeWorkspacePathKey(key) && looksLikeAbsolutePath(trimmed)) {
+			entries.push({
+				name: inheritedName,
+				path: trimmed,
+				source,
+				uri: null,
+			});
+		}
+	};
+
+	visit(value);
+	return dedupeWorkspaceEntries(entries);
+}
+
+function readOptionalWorkspaceString(value: unknown): string | null {
+	if (typeof value !== "string") {
+		return null;
+	}
+	const trimmed = value.trim();
+	return trimmed ? trimmed : null;
+}
+
+function looksLikeWorkspaceUriKey(key: string | null): boolean {
+	return key === "uri" || key === "rootUri" || key === "root_uri" || key === "url";
+}
+
+function looksLikeWorkspacePathKey(key: string | null): boolean {
+	return (
+		key === "path" ||
+		key === "rootPath" ||
+		key === "root_path" ||
+		key === "cwd" ||
+		key === "workspacePath" ||
+		key === "workspaceRoot"
+	);
+}
+
+function looksLikeAbsolutePath(value: string): boolean {
+	return value.startsWith("/") || value.startsWith("\\\\") || /^[A-Za-z]:[\\/]/.test(value);
+}
+
+export function fileUriToFilesystemPath(uri: string, platform: NodeJS.Platform = process.platform): string | null {
+	let parsed: URL;
+	try {
+		parsed = new URL(uri);
+	} catch {
+		return null;
+	}
+
+	if (parsed.protocol !== "file:") {
+		return null;
+	}
+
+	const hostname = parsed.hostname;
+	const decodedPath = decodeURIComponent(parsed.pathname);
+	if (platform === "win32") {
+		if (hostname && hostname !== "localhost") {
+			return `\\\\${hostname}${decodedPath.replaceAll("/", "\\")}`;
+		}
+		if (/^\/[A-Za-z]:/.test(decodedPath)) {
+			return decodedPath.slice(1).replaceAll("/", "\\");
+		}
+		// Preserve POSIX-style file URIs like file:///tmp/repo on Windows instead of
+		// fabricating \\tmp\\repo, which is not a meaningful Windows filesystem path.
+		return decodedPath || "/";
+	}
+
+	if (hostname && hostname !== "localhost") {
+		return `//${hostname}${decodedPath}`;
+	}
+	return decodedPath || "/";
+}
+
+function resolveClientDerivedCwd(state: ClientWorkspaceState): ResolvedClientCwd | null {
+	const candidates = [
+		{
+			detail: "roots/list",
+			entries: state.rootsEntries,
+			source: "client-roots",
+		},
+		{
+			detail: "workspace context",
+			entries: state.workspaceEntries,
+			source: "client-workspace",
+		},
+		{
+			detail: "initialize payload",
+			entries: state.initializeEntries,
+			source: "client-initialize",
+		},
+	];
+
+	for (const candidateGroup of candidates) {
+		const pathEntries = candidateGroup.entries.filter((entry) => entry.path !== null);
+		if (pathEntries.length === 0) {
+			continue;
+		}
+
+		return {
+			candidateCount: pathEntries.length,
+			cwd: pathEntries[0].path ?? "",
+			detail: pathEntries.length > 1 ? `${candidateGroup.detail} first root` : `${candidateGroup.detail} only root`,
+			source: candidateGroup.source,
+		};
+	}
+
+	return null;
+}
+
+function resolveToolCallCwd(state: ClientWorkspaceState): {
+	candidateCount: number;
+	cwd: string;
+	detail: string;
+	source: "client-derived" | "process.cwd()";
+	warning: string | null;
+} {
+	const clientDerived = resolveClientDerivedCwd(state);
+	if (clientDerived !== null) {
+		return {
+			...clientDerived,
+			source: "client-derived",
+			warning: null,
+		};
+	}
+
+	return {
+		candidateCount: 0,
+		cwd: process.cwd(),
+		detail: "last-resort process.cwd() fallback",
+		source: "process.cwd()",
+		warning: "No usable client-derived workspace cwd was available for this call.",
+	};
+}
+
+async function maybeRequestClientRoots(
+	reason: string,
+	context: {
+		allocateOuterServerRequestId: () => JsonRpcId;
+		clientWorkspaceState: ClientWorkspaceState;
+		clientWriter: JsonRpcLineWriter;
+		pendingWorkspaceRequests: Map<string, PendingWorkspaceRequest>;
+	},
+): Promise<void> {
+	if (!context.clientWorkspaceState.rootsAdvertised) {
+		return;
+	}
+	if (context.clientWorkspaceState.rootsEntries.length > 0 || context.clientWorkspaceState.rootsRequested) {
+		return;
+	}
+	if (context.pendingWorkspaceRequests.size > 0) {
+		return;
+	}
+
+	const requestId = context.allocateOuterServerRequestId();
+	context.clientWorkspaceState.rootsRequested = true;
+	context.pendingWorkspaceRequests.set(jsonRpcIdKey(requestId), {
+		method: "roots/list",
+		reason,
+	});
+	process.stderr.write(
+		`[yolo-codex-mcp][client-cwd] ${JSON.stringify({
+			method: "roots/list",
+			reason,
+			status: "requesting",
+		})}\n`,
+	);
+	await context.clientWriter.write({
+		id: requestId,
+		jsonrpc: "2.0",
+		method: "roots/list",
+		params: {},
+	});
+}
+
+function logWorkspaceRequestCompletion(request: PendingWorkspaceRequest, state: ClientWorkspaceState): void {
+	logObservedClientWorkspaceState(request.method, state, {
+		reason: request.reason,
+		status: "completed",
+	});
+}
+
+function logObservedClientWorkspaceState(
+	source: string,
+	state: ClientWorkspaceState,
+	extra: Record<string, unknown> = {},
+): void {
+	const selected = resolveClientDerivedCwd(state);
+	process.stderr.write(
+		`[yolo-codex-mcp][client-cwd] ${JSON.stringify({
+			...extra,
+			activeInitialize: summarizeWorkspaceEntries(state.initializeEntries),
+			activeRoots: summarizeWorkspaceEntries(state.rootsEntries),
+			activeWorkspace: summarizeWorkspaceEntries(state.workspaceEntries),
+			heuristic: selected?.candidateCount !== undefined && selected.candidateCount > 1 ? "first-root" : null,
+			selectedCwd: selected?.cwd ?? null,
+			selectedSource: selected?.source ?? null,
+			source,
+		})}\n`,
+	);
+}
+
+function logToolCallCwdDecision(
+	requestId: JsonRpcId,
+	toolName: PendingToolCall["toolName"],
+	resolved: {
+		candidateCount: number;
+		cwd: string;
+		detail: string;
+		source: "client-derived" | "process.cwd()";
+		warning: string | null;
+	},
+	state: ClientWorkspaceState,
+): void {
+	process.stderr.write(
+		`[yolo-codex-mcp][cwd] ${JSON.stringify({
+			activeClientRoots: summarizeWorkspaceEntries(state.rootsEntries),
+			activeWorkspaceRoots: summarizeWorkspaceEntries(state.workspaceEntries),
+			candidateCount: resolved.candidateCount,
+			cwd: resolved.cwd,
+			detail: resolved.detail,
+			requestId,
+			source: resolved.source,
+			tool: toolName,
+			warning: resolved.warning,
+		})}\n`,
+	);
+}
+
+function logForwardedToolArguments(
+	requestId: JsonRpcId,
+	toolName: PendingToolCall["toolName"],
+	argumentsValue: Record<string, unknown>,
+): void {
+	process.stderr.write(
+		`[yolo-codex-mcp][tools-forward] ${JSON.stringify({
+			arguments: argumentsValue,
+			requestId,
+			tool: toolName,
+		})}\n`,
+	);
+}
+
+function logIgnoredLegacyToolCwd(requestId: JsonRpcId, toolName: PendingToolCall["toolName"], cwd: string): void {
+	process.stderr.write(
+		`[yolo-codex-mcp][cwd-legacy] ${JSON.stringify({
+			ignoredCwd: cwd,
+			reason:
+				"Outer tool cwd is legacy-only and ignored. The wrapper derives cwd server-side from client workspace context.",
+			requestId,
+			tool: toolName,
+		})}\n`,
+	);
+}
+
+function summarizeWorkspaceEntries(entries: ClientWorkspaceEntry[]): Array<Record<string, unknown>> {
+	return entries.map((entry) => ({
+		name: entry.name,
+		path: entry.path,
+		source: entry.source,
+		uri: entry.uri,
+	}));
 }
 
 function createPendingToolCall(
@@ -814,7 +1492,9 @@ export function normalizeRolloutPathForFilesystem(
 	const wslDistro =
 		sessionRoot?.wslDistro ??
 		options.wslDistro ??
-		(options.env === undefined ? lookupWslSessionsRoot(process.env)?.distro : lookupWslSessionsRoot(options.env)?.distro) ??
+		(options.env === undefined
+			? lookupWslSessionsRoot(process.env)?.distro
+			: lookupWslSessionsRoot(options.env)?.distro) ??
 		null;
 	return wslDistro === null ? rolloutPath : `\\\\wsl$\\${wslDistro}${rolloutPath.replace(/\//g, "\\")}`;
 }
@@ -969,16 +1649,12 @@ function prefixInnerStderr(chunk: Buffer | string): string {
 	return `[inner codex] ${normalized.replaceAll("\n", "\n[inner codex] ")}${text.endsWith("\n") ? "\n" : ""}`;
 }
 
-function formatLoggedEnvValue(value: string | undefined): string {
-	return value === undefined ? '"undefined"' : JSON.stringify(value);
-}
-
 function logInboundClientMessage(
 	message: JsonRpcMessage,
 	pendingInnerRequests: Map<string, PendingInnerRequest>,
-	mode: DebugInboundMode,
+	pendingWorkspaceRequests: Map<string, PendingWorkspaceRequest>,
 ): void {
-	const logEntry = createInboundLogEntry(message, pendingInnerRequests, mode);
+	const logEntry = createInboundLogEntry(message, pendingInnerRequests, pendingWorkspaceRequests);
 	if (logEntry === null) {
 		return;
 	}
@@ -989,10 +1665,10 @@ function logInboundClientMessage(
 function createInboundLogEntry(
 	message: JsonRpcMessage,
 	pendingInnerRequests: Map<string, PendingInnerRequest>,
-	mode: DebugInboundMode,
+	pendingWorkspaceRequests: Map<string, PendingWorkspaceRequest>,
 ): Record<string, unknown> | null {
 	if (isJsonRpcRequest(message)) {
-		if (!shouldLogInboundMethod(message.method, mode)) {
+		if (!shouldLogInboundMethod(message.method)) {
 			return null;
 		}
 
@@ -1000,24 +1676,25 @@ function createInboundLogEntry(
 			id: message.id,
 			kind: "request",
 			method: message.method,
-			params: formatInboundPayload(message.params, mode),
+			params: message.params,
 		};
 	}
 
 	if (isJsonRpcNotification(message)) {
-		if (!shouldLogInboundMethod(message.method, mode)) {
+		if (!shouldLogInboundMethod(message.method)) {
 			return null;
 		}
 
 		return {
 			kind: "notification",
 			method: message.method,
-			params: formatInboundPayload(message.params, mode),
+			params: message.params,
 		};
 	}
 
-	const pendingRequest = pendingInnerRequests.get(jsonRpcIdKey(message.id));
-	if (!pendingRequest || !shouldLogInboundMethod(pendingRequest.method, mode)) {
+	const pendingRequest =
+		pendingInnerRequests.get(jsonRpcIdKey(message.id)) ?? pendingWorkspaceRequests.get(jsonRpcIdKey(message.id));
+	if (!pendingRequest || !shouldLogInboundMethod(pendingRequest.method)) {
 		return null;
 	}
 
@@ -1026,13 +1703,13 @@ function createInboundLogEntry(
 			forMethod: pendingRequest.method,
 			id: message.id,
 			kind: "response",
-			result: formatInboundPayload(message.result, mode),
+			result: message.result,
 		};
 	}
 
 	if (isJsonRpcError(message)) {
 		return {
-			error: formatInboundPayload(message.error, mode),
+			error: message.error,
 			forMethod: pendingRequest.method,
 			id: message.id,
 			kind: "error",
@@ -1042,81 +1719,16 @@ function createInboundLogEntry(
 	return null;
 }
 
-function shouldLogInboundMethod(method: string, mode: DebugInboundMode): boolean {
-	const isSelectedMethod = isSelectedInboundMethod(method);
-	switch (mode) {
-		case "selected":
-			return isSelectedMethod;
-		case "unknown":
-			return !isSelectedMethod;
-		case "all":
-		case "verbose":
-			return true;
-		case "off":
-			return false;
-	}
-}
-
-function isSelectedInboundMethod(method: string): boolean {
+function shouldLogInboundMethod(method: string): boolean {
 	return (
 		method === "initialize" ||
 		method === "notifications/initialized" ||
+		method === "tools/call" ||
+		method.startsWith("elicitation/") ||
 		method.startsWith("roots/") ||
 		method.startsWith("workspace/") ||
 		method.startsWith("$/")
 	);
-}
-
-function formatInboundPayload(value: unknown, mode: DebugInboundMode): unknown {
-	return mode === "verbose" ? value : summarizeForLog(value);
-}
-
-function summarizeForLog(value: unknown, depth = 0): unknown {
-	const maxArrayEntries = 10;
-	const maxDepth = 4;
-	const maxObjectEntries = 20;
-	const maxStringLength = 240;
-
-	if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "undefined") {
-		return value;
-	}
-
-	if (typeof value === "string") {
-		return value.length <= maxStringLength ? value : `${value.slice(0, maxStringLength)}... (${value.length} chars)`;
-	}
-
-	if (Array.isArray(value)) {
-		if (depth >= maxDepth) {
-			return `[array(${value.length})]`;
-		}
-
-		const summarized = value.slice(0, maxArrayEntries).map((entry) => summarizeForLog(entry, depth + 1));
-		if (value.length > maxArrayEntries) {
-			summarized.push(`... (${value.length - maxArrayEntries} more items)`);
-		}
-		return summarized;
-	}
-
-	if (isRecord(value)) {
-		if (depth >= maxDepth) {
-			return {
-				__keys: Object.keys(value).slice(0, maxObjectEntries),
-				__summary: "object truncated",
-			};
-		}
-
-		const summarized: Record<string, unknown> = {};
-		const entries = Object.entries(value);
-		for (const [key, entryValue] of entries.slice(0, maxObjectEntries)) {
-			summarized[key] = summarizeForLog(entryValue, depth + 1);
-		}
-		if (entries.length > maxObjectEntries) {
-			summarized.__truncated__ = `${entries.length - maxObjectEntries} more keys`;
-		}
-		return summarized;
-	}
-
-	return Object.prototype.toString.call(value);
 }
 
 export function createInnerServerSpawnSpec(

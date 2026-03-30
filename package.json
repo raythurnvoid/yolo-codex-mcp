@@ -1,7 +1,7 @@
 {
 	"name": "yolo-codex-mcp",
 	"version": "0.0.0",
-	"description": "Custom stdio MCP server that exposes Codex CLI tools for host-driven execution.",
+	"description": "Custom stdio MCP server that exposes the Smart Cheap Agent wrapper around Codex CLI tools for host-driven execution.",
 	"keywords": [],
 	"license": "ISC",
 	"author": "",

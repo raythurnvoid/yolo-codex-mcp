@@ -22,11 +22,24 @@ const codexOutputSchema: JsonObjectSchema = {
 export type OuterCodexCall = {
 	agentInstructions: string | null;
 	compactPrompt: string | null;
-	cwd: string | null;
+	legacyCwd: string | null;
 	prompt: string;
 };
 
 export type OuterCodexReplyCall = {
+	legacyCwd: string | null;
+	prompt: string;
+	threadId: string;
+};
+
+type InnerCodexCall = {
+	agentInstructions: string | null;
+	compactPrompt: string | null;
+	cwd: string | null;
+	prompt: string;
+};
+
+type InnerCodexReplyCall = {
 	cwd: string | null;
 	prompt: string;
 	threadId: string;
@@ -37,26 +50,23 @@ export function createReducedToolsListResult(): ListToolsResult {
 		tools: [
 			{
 				name: "codex",
-				title: "Codex",
-				description: "Run a Codex session with proxy-managed policy settings.",
+				title: "Smart Cheap Agent",
+				description:
+					"Preferred first tool for delegating complex, context-heavy work with proxy-managed policy settings. Smart Cheap Agent runs a smarter reasoning agent that can read and edit files, browse the web, and use MCP tools configured for the user; prefer it for architectural decisions, deep research, browser navigation, testing and QA, or multi-step debugging because it is usually cheaper and more cost-efficient than spending the host model's context. The response includes a human-readable answer in content/text plus structuredContent with threadId and content. To continue the same session, call codex-reply with the returned threadId from the prior response; for attached guidance, read yolo-codex-mcp://guides/operating-guide.md.",
 				inputSchema: {
 					type: "object",
 					properties: {
 						prompt: {
 							type: "string",
-							description: "The initial user prompt to start the Codex conversation.",
+							description: "The initial user prompt to start the Smart Cheap Agent conversation.",
 						},
 						"agent-instructions": {
 							type: "string",
-							description: "Optional developer instructions forwarded to Codex.",
+							description: "Optional developer instructions forwarded to Smart Cheap Agent.",
 						},
 						"compact-prompt": {
 							type: "string",
-							description: "Optional prompt override used when Codex compacts the conversation.",
-						},
-						cwd: {
-							type: "string",
-							description: "Optional working directory forwarded to Codex for this call.",
+							description: "Optional prompt override used when Smart Cheap Agent compacts the conversation.",
 						},
 					},
 					required: ["prompt"],
@@ -65,22 +75,20 @@ export function createReducedToolsListResult(): ListToolsResult {
 			},
 			{
 				name: "codex-reply",
-				title: "Codex Reply",
-				description: "Continue a Codex conversation by thread id and prompt.",
+				title: "Smart Cheap Agent Reply",
+				description:
+					"Continue the same Smart Cheap Agent session with proxy-managed policy settings. Pass the threadId returned by codex or a previous codex-reply call to keep the conversation on the same session. The response includes the same shape as codex: a human-readable answer in content/text plus structuredContent with threadId and content. For attached guidance, read yolo-codex-mcp://guides/operating-guide.md.",
 				inputSchema: {
 					type: "object",
 					properties: {
 						threadId: {
 							type: "string",
-							description: "The thread id for this Codex session.",
+							description:
+								"The threadId returned by codex or a previous codex-reply call for the same Smart Cheap Agent session.",
 						},
 						prompt: {
 							type: "string",
-							description: "The next user prompt to continue the Codex conversation.",
-						},
-						cwd: {
-							type: "string",
-							description: "Optional working directory forwarded to Codex for this call.",
+							description: "The next user prompt to continue the Smart Cheap Agent conversation.",
 						},
 					},
 					required: ["threadId", "prompt"],
@@ -98,7 +106,7 @@ export function parseOuterCodexCall(argumentsValue: unknown): OuterCodexCall {
 		prompt,
 		agentInstructions: readOptionalString(args["agent-instructions"]),
 		compactPrompt: readOptionalString(args["compact-prompt"]),
-		cwd: readOptionalString(args.cwd),
+		legacyCwd: readOptionalString(args.cwd),
 	};
 }
 
@@ -113,11 +121,11 @@ export function parseOuterCodexReplyCall(argumentsValue: unknown): OuterCodexRep
 	return {
 		threadId,
 		prompt,
-		cwd: readOptionalString(args.cwd),
+		legacyCwd: readOptionalString(args.cwd),
 	};
 }
 
-export function buildInnerCodexArguments(call: OuterCodexCall, policy: ProxyPolicy) {
+export function buildInnerCodexArguments(call: InnerCodexCall, policy: ProxyPolicy) {
 	const forwarded: Record<string, unknown> = {
 		prompt: call.prompt,
 		sandbox: policy.sandbox,
@@ -132,8 +140,6 @@ export function buildInnerCodexArguments(call: OuterCodexCall, policy: ProxyPoli
 	}
 	if (call.cwd !== null) {
 		forwarded.cwd = call.cwd;
-	} else if (policy.cwd !== null) {
-		forwarded.cwd = policy.cwd;
 	}
 	if (call.agentInstructions !== null) {
 		forwarded["developer-instructions"] = call.agentInstructions;
@@ -145,7 +151,7 @@ export function buildInnerCodexArguments(call: OuterCodexCall, policy: ProxyPoli
 	return forwarded;
 }
 
-export function buildInnerCodexReplyArguments(call: OuterCodexReplyCall, policy: ProxyPolicy) {
+export function buildInnerCodexReplyArguments(call: InnerCodexReplyCall, _policy: ProxyPolicy) {
 	const forwarded: Record<string, unknown> = {
 		threadId: call.threadId,
 		prompt: call.prompt,
@@ -153,8 +159,6 @@ export function buildInnerCodexReplyArguments(call: OuterCodexReplyCall, policy:
 
 	if (call.cwd !== null) {
 		forwarded.cwd = call.cwd;
-	} else if (policy.cwd !== null) {
-		forwarded.cwd = policy.cwd;
 	}
 
 	return forwarded;

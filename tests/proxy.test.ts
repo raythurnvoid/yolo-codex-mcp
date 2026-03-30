@@ -4,12 +4,14 @@ import { access, mkdtemp, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { createInterface } from "node:readline";
 import { ListToolsResultSchema } from "@modelcontextprotocol/sdk/types.js";
 
 import { loadProxyConfig } from "../src/proxy_config.ts";
 import {
 	createInnerServerSpawnSpec,
+	fileUriToFilesystemPath,
 	normalizeRolloutPathForFilesystem,
 	resolveInnerServerCommand,
 	resolveInnerServerLaunch,
@@ -78,10 +80,12 @@ void test("tools/list exposes only the reduced outer schemas", async () => {
 	const result = response.result as {
 		nextCursor?: unknown;
 		tools: Array<{
+			description: string;
 			inputSchema: {
 				properties: Record<string, unknown>;
 			};
 			name: string;
+			title?: string;
 		}>;
 	};
 
@@ -89,16 +93,101 @@ void test("tools/list exposes only the reduced outer schemas", async () => {
 		result.tools.map((tool) => tool.name),
 		["codex", "codex-reply"],
 	);
+	assert.deepEqual(
+		result.tools.map((tool) => tool.title),
+		["Smart Cheap Agent", "Smart Cheap Agent Reply"],
+	);
 	assert.equal(rawLine.includes('"nextCursor":'), false);
 	assert.doesNotThrow(() => ListToolsResultSchema.parse(result));
 	assert.equal("nextCursor" in result, false);
 	assert.deepEqual(Object.keys(result.tools[0].inputSchema.properties).sort(), [
 		"agent-instructions",
 		"compact-prompt",
-		"cwd",
 		"prompt",
 	]);
-	assert.deepEqual(Object.keys(result.tools[1].inputSchema.properties).sort(), ["cwd", "prompt", "threadId"]);
+	assert.deepEqual(Object.keys(result.tools[1].inputSchema.properties).sort(), ["prompt", "threadId"]);
+	assert.match(result.tools[0].description, /Preferred first tool for delegating complex, context-heavy work/);
+	assert.match(result.tools[0].description, /Smart Cheap Agent runs a smarter reasoning agent/);
+	assert.match(result.tools[0].description, /usually cheaper and more cost-efficient/);
+	assert.match(
+		result.tools[0].description,
+		/human-readable answer in content\/text plus structuredContent with threadId and content/,
+	);
+	assert.match(result.tools[0].description, /call codex-reply with the returned threadId from the prior response/);
+	assert.match(result.tools[1].description, /Pass the threadId returned by codex or a previous codex-reply call/);
+	assert.match(result.tools[1].description, /Continue the same Smart Cheap Agent session/);
+	assert.match(result.tools[1].description, /same shape as codex/);
+});
+
+void test("initialize advertises resources capability on the outer wrapper", async () => {
+	const server = await createProxyHarness();
+
+	const { response } = await server.requestWithRaw("initialize", {
+		clientInfo: {
+			name: "test-client",
+			title: "Test Client",
+			version: "0.0.0",
+		},
+		capabilities: {},
+		protocolVersion: "2025-03-26",
+	});
+	const result = response.result as {
+		capabilities?: Record<string, unknown>;
+	};
+
+	assert.deepEqual(result.capabilities?.tools, {
+		listChanged: true,
+	});
+	assert.deepEqual(result.capabilities?.resources, {});
+});
+
+void test("resources/list exposes attached guidance documents", async () => {
+	const server = await createProxyHarness();
+	await server.initialize();
+
+	const response = await server.request("resources/list", {});
+	const result = response.result as {
+		resources: Array<{
+			mimeType: string;
+			name: string;
+			uri: string;
+		}>;
+	};
+
+	assert.deepEqual(
+		result.resources.map((resource) => resource.name),
+		["operating-guide"],
+	);
+	assert.deepEqual(
+		result.resources.map((resource) => resource.uri),
+		["yolo-codex-mcp://guides/operating-guide.md"],
+	);
+	assert.ok(result.resources.every((resource) => resource.mimeType === "text/markdown"));
+});
+
+void test("resources/read returns usage and rollout guidance", async () => {
+	const server = await createProxyHarness();
+	await server.initialize();
+
+	const response = await server.request("resources/read", {
+		uri: "yolo-codex-mcp://guides/operating-guide.md",
+	});
+
+	const guideText = (
+		response.result as {
+			contents: Array<{
+				text: string;
+			}>;
+		}
+	).contents[0]?.text;
+
+	assert.match(guideText ?? "", /structuredContent\.threadId/);
+	assert.match(guideText ?? "", /Smart Cheap Agent/);
+	assert.match(guideText ?? "", /codex-reply/);
+	assert.match(guideText ?? "", /~\/\.codex\/sessions/);
+	assert.match(guideText ?? "", /rollout-<timestamp>-<threadId>\.jsonl/);
+	assert.match(guideText ?? "", /debugging complex failures/);
+	assert.match(guideText ?? "", /browser-tool workflows/);
 });
 
 void test("codex call injects fixed policy and maps agent-instructions", async () => {
@@ -162,17 +251,25 @@ void test("codex call defaults cwd to the wrapper process cwd", async () => {
 	assert.equal(forwardedRunParams.arguments.cwd, process.cwd());
 });
 
-void test("codex call uses CODEX_MCP_CWD when configured", async () => {
-	const configuredCwd = path.join(path.resolve("."), "custom-cwd");
-	const server = await createProxyHarness({
-		CODEX_MCP_CWD: configuredCwd,
-	});
+void test("codex call derives cwd from inbound workspace notifications", async () => {
+	const server = await createProxyHarness();
 	await server.initialize();
+	await server.notify("workspace/didChangeWorkspaceFolders", {
+		event: {
+			added: [
+				{
+					name: "repo",
+					uri: "file:///tmp/repo",
+				},
+			],
+			removed: [],
+		},
+	});
 
 	await server.request("tools/call", {
 		name: "codex",
 		arguments: {
-			prompt: "cwd-override",
+			prompt: "cwd-from-workspace-notification",
 		},
 	});
 
@@ -180,22 +277,33 @@ void test("codex call uses CODEX_MCP_CWD when configured", async () => {
 	const forwardedRunParams = forwardedCall.params as {
 		arguments: Record<string, unknown>;
 	};
-	assert.equal(forwardedRunParams.arguments.cwd, configuredCwd);
+	assert.equal(forwardedRunParams.arguments.cwd, "/tmp/repo");
+
+	const stderr = await server.waitForStderr('"source":"client-derived"');
+	assert.match(stderr, /\[yolo-codex-mcp\]\[client-cwd\].*"source":"workspace\/didChangeWorkspaceFolders"/);
+	assert.match(stderr, /\[yolo-codex-mcp\]\[cwd\].*"detail":"workspace context only root"/);
 });
 
-void test("codex call prefers an explicit per-call cwd over the wrapper default", async () => {
-	const configuredCwd = path.join(path.resolve("."), "policy-cwd");
-	const explicitCwd = path.join(path.resolve("."), "call-cwd");
-	const server = await createProxyHarness({
-		CODEX_MCP_CWD: configuredCwd,
-	});
+void test("legacy outer cwd is ignored and logged while server-derived cwd wins", async () => {
+	const server = await createProxyHarness();
 	await server.initialize();
+	await server.notify("workspace/didChangeWorkspaceFolders", {
+		event: {
+			added: [
+				{
+					name: "repo",
+					uri: "file:///tmp/dynamic-root",
+				},
+			],
+			removed: [],
+		},
+	});
 
 	await server.request("tools/call", {
 		name: "codex",
 		arguments: {
-			prompt: "cwd-explicit",
-			cwd: explicitCwd,
+			prompt: "ignore-legacy-cwd",
+			cwd: "/tmp/legacy-path",
 		},
 	});
 
@@ -203,7 +311,74 @@ void test("codex call prefers an explicit per-call cwd over the wrapper default"
 	const forwardedRunParams = forwardedCall.params as {
 		arguments: Record<string, unknown>;
 	};
-	assert.equal(forwardedRunParams.arguments.cwd, explicitCwd);
+	assert.equal(forwardedRunParams.arguments.cwd, "/tmp/dynamic-root");
+
+	const stderr = await server.waitForStderr("[yolo-codex-mcp][cwd-legacy]");
+	assert.match(stderr, /\[yolo-codex-mcp\]\[cwd-legacy\].*"ignoredCwd":"\/tmp\/legacy-path"/);
+	assert.match(stderr, /\[yolo-codex-mcp\]\[cwd\].*"source":"client-derived"/);
+});
+
+void test("codex call derives cwd from proactive roots/list when the client advertises roots support", async () => {
+	const server = await createProxyHarness();
+	await server.initialize({
+		capabilities: {
+			roots: {
+				listChanged: true,
+			},
+		},
+	});
+
+	const rootsRequest = await server.readUntilRequest("roots/list");
+	await server.respond(rootsRequest.id, {
+		roots: [
+			{
+				name: "repo",
+				uri: "file:///tmp/from-roots",
+			},
+		],
+	});
+
+	await server.request("tools/call", {
+		name: "codex",
+		arguments: {
+			prompt: "cwd-from-proactive-roots",
+		},
+	});
+
+	const forwardedCall = await server.findCapturedRequest("tools/call", "codex");
+	const forwardedRunParams = forwardedCall.params as {
+		arguments: Record<string, unknown>;
+	};
+	assert.equal(forwardedRunParams.arguments.cwd, "/tmp/from-roots");
+
+	const stderr = await server.waitForStderr('"reason":"notifications/initialized"');
+	assert.match(stderr, /\[yolo-codex-mcp\]\[client-cwd\].*"method":"roots\/list".*"status":"requesting"/);
+	assert.match(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"forMethod":"roots\/list"/);
+	assert.match(stderr, /\[yolo-codex-mcp\]\[cwd\].*"detail":"roots\/list only root"/);
+});
+
+void test("codex call falls back to process.cwd only when client context is unavailable", async () => {
+	const server = await createProxyHarness({
+		CODEX_MCP_CWD: path.join(path.resolve("."), "ignored-env-cwd"),
+	});
+	await server.initialize();
+
+	await server.request("tools/call", {
+		name: "codex",
+		arguments: {
+			prompt: "cwd-process-fallback",
+		},
+	});
+
+	const forwardedCall = await server.findCapturedRequest("tools/call", "codex");
+	const forwardedRunParams = forwardedCall.params as {
+		arguments: Record<string, unknown>;
+	};
+	assert.equal(forwardedRunParams.arguments.cwd, process.cwd());
+
+	const stderr = await server.waitForStderr("No usable client-derived workspace cwd was available");
+	assert.match(stderr, /\[yolo-codex-mcp\]\[cwd-fallback\].*"source":"process\.cwd\(\)"/);
+	assert.match(stderr, /\[yolo-codex-mcp\]\[cwd\].*"source":"process\.cwd\(\)"/);
 });
 
 void test("codex-reply forwards threadId and supports deprecated conversationId input", async () => {
@@ -242,17 +417,27 @@ void test("codex-reply forwards threadId and supports deprecated conversationId 
 	});
 });
 
-void test("codex-reply forwards an explicit per-call cwd", async () => {
-	const explicitCwd = path.join(path.resolve("."), "reply-cwd");
+void test("codex-reply derives cwd server-side and ignores legacy outer cwd", async () => {
 	const server = await createProxyHarness();
 	await server.initialize();
+	await server.notify("workspace/didChangeWorkspaceFolders", {
+		event: {
+			added: [
+				{
+					name: "reply-repo",
+					uri: "file:///tmp/reply-root",
+				},
+			],
+			removed: [],
+		},
+	});
 
 	await server.request("tools/call", {
 		name: "codex-reply",
 		arguments: {
 			threadId: "thr_explicit_cwd",
 			prompt: "next",
-			cwd: explicitCwd,
+			cwd: "/tmp/legacy-reply-cwd",
 		},
 	});
 
@@ -263,7 +448,7 @@ void test("codex-reply forwards an explicit per-call cwd", async () => {
 	assert.deepEqual(forwardedReplyParams.arguments, {
 		threadId: "thr_explicit_cwd",
 		prompt: "next",
-		cwd: explicitCwd,
+		cwd: "/tmp/reply-root",
 	});
 });
 
@@ -361,10 +546,8 @@ void test("late inner responses are suppressed after synthetic rollout completio
 	await server.assertNoAdditionalResponse(response.id, 2_500);
 });
 
-void test("debug inbound logging captures handshake, workspace notifications, and roots responses", async () => {
-	const server = await createProxyHarness({
-		CODEX_MCP_DEBUG_INBOUND: "1",
-	});
+void test("always-on logging captures handshake, workspace notifications, roots responses, and forwarded tool args", async () => {
+	const server = await createProxyHarness();
 	await server.initialize();
 	await server.notify("workspace/didChangeWorkspaceFolders", {
 		event: {
@@ -384,6 +567,7 @@ void test("debug inbound logging captures handshake, workspace notifications, an
 		token: "tok-1",
 	});
 
+	const fullPrompt = `${"x".repeat(280)}-tail`;
 	const responsePromise = server.request("tools/call", {
 		name: "codex",
 		arguments: {
@@ -400,50 +584,6 @@ void test("debug inbound logging captures handshake, workspace notifications, an
 		],
 	});
 	await responsePromise;
-
-	const stderr = await server.waitForStderr('"forMethod":"roots/list"');
-	assert.match(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"method":"initialize"/);
-	assert.match(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"method":"notifications\/initialized"/);
-	assert.match(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"method":"workspace\/didChangeWorkspaceFolders"/);
-	assert.match(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"method":"\$\/progress"/);
-	assert.match(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"forMethod":"roots\/list"/);
-	assert.match(stderr, /file:\/\/\/tmp\/repo/);
-});
-
-void test("debug inbound unknown mode logs non-whitelisted methods without selected handshake noise", async () => {
-	const server = await createProxyHarness({
-		CODEX_MCP_DEBUG_INBOUND: "unknown",
-	});
-	await server.initialize();
-	await server.notify("client/custom", {
-		content: "hello",
-	});
-
-	const stderr = await server.waitForStderr('"method":"client/custom"');
-	assert.match(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"method":"client\/custom"/);
-	assert.doesNotMatch(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"method":"initialize"/);
-	assert.doesNotMatch(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"method":"notifications\/initialized"/);
-});
-
-void test("debug inbound all mode logs tools requests with summarized payloads", async () => {
-	const server = await createProxyHarness({
-		CODEX_MCP_DEBUG_INBOUND: "all",
-	});
-	await server.initialize();
-
-	await server.request("tools/list", {});
-
-	const stderr = await server.waitForStderr('"method":"tools/list"');
-	assert.match(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"method":"tools\/list"/);
-});
-
-void test("debug inbound verbose mode logs full tool payloads", async () => {
-	const server = await createProxyHarness({
-		CODEX_MCP_DEBUG_INBOUND: "verbose",
-	});
-	await server.initialize();
-
-	const fullPrompt = `${"x".repeat(280)}-tail`;
 	await server.request("tools/call", {
 		name: "codex",
 		arguments: {
@@ -452,7 +592,14 @@ void test("debug inbound verbose mode logs full tool payloads", async () => {
 	});
 
 	const stderr = await server.waitForStderr(fullPrompt);
+	assert.match(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"method":"initialize"/);
+	assert.match(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"method":"notifications\/initialized"/);
+	assert.match(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"method":"workspace\/didChangeWorkspaceFolders"/);
+	assert.match(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"method":"\$\/progress"/);
 	assert.match(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"method":"tools\/call"/);
+	assert.match(stderr, /\[yolo-codex-mcp\]\[mcp-in\].*"forMethod":"roots\/list"/);
+	assert.match(stderr, /\[yolo-codex-mcp\]\[tools-forward\].*"tool":"codex"/);
+	assert.match(stderr, /file:\/\/\/tmp\/repo/);
 	assert.match(stderr, new RegExp(`${fullPrompt}"`));
 });
 
@@ -555,42 +702,38 @@ void test("loadProxyConfig falls back to CODEX_BIN for compatibility", () => {
 	assert.deepEqual(config.innerArgs, ["mcp-server"]);
 });
 
-void test("loadProxyConfig uses CODEX_MCP_CWD when it is non-empty after trimming", () => {
+void test("loadProxyConfig ignores removed cwd/debug env vars", () => {
 	const config = loadProxyConfig({
-		CODEX_MCP_CWD: "  /tmp/codex-workspace  ",
+		CODEX_MCP_CWD: "/tmp/ignored",
+		CODEX_MCP_DEBUG_INBOUND: "off",
 	});
 
-	assert.equal(config.policy.cwd, "/tmp/codex-workspace");
+	assert.deepEqual(config.policy, {
+		approvalPolicy: "never",
+		model: null,
+		profile: null,
+		sandbox: "danger-full-access",
+	});
 });
 
-void test("loadProxyConfig defaults cwd to process.cwd() when CODEX_MCP_CWD is unset or blank", () => {
-	assert.equal(loadProxyConfig({}).policy.cwd, process.cwd());
-	assert.equal(
-		loadProxyConfig({
-			CODEX_MCP_CWD: "   ",
-		}).policy.cwd,
-		process.cwd(),
-	);
+void test("fileUriToFilesystemPath handles Windows drive and UNC roots", () => {
+	assert.equal(fileUriToFilesystemPath("file:///C:/Users/dev/repo", "win32"), "C:\\Users\\dev\\repo");
+	assert.equal(fileUriToFilesystemPath("file://server/share/repo", "win32"), "\\\\server\\share\\repo");
+	assert.equal(fileUriToFilesystemPath("file:///tmp/repo", "win32"), "/tmp/repo");
 });
 
-void test("loadProxyConfig treats an unexpanded Cursor workspace placeholder as unset", () => {
-	assert.equal(
-		loadProxyConfig({
-			CODEX_MCP_CWD: "  ${workspaceFolder}  ",
-		}).policy.cwd,
-		process.cwd(),
-	);
-});
+void test("Cursor cwd hook tolerates quoted hook envelopes and does not inject cwd", async () => {
+	const hookPath = path.resolve(".cursor/hooks/inject-yolo-cwd.mjs");
+	const malformedQuotedEnvelope =
+		'"{"tool_name":"MCP:codex","workspace_roots":["/tmp/hook-repo"],"tool_input":"{\\"prompt\\":\\"hello\\"}"}"';
+	const result = await runScriptWithStdin(hookPath, malformedQuotedEnvelope);
 
-void test("loadProxyConfig parses inbound debug modes", () => {
-	assert.equal(loadProxyConfig({}).debugInbound, "off");
-	assert.equal(loadProxyConfig({ CODEX_MCP_DEBUG_INBOUND: "1" }).debugInbound, "selected");
-	assert.equal(loadProxyConfig({ CODEX_MCP_DEBUG_INBOUND: "true" }).debugInbound, "selected");
-	assert.equal(loadProxyConfig({ CODEX_MCP_DEBUG_INBOUND: "selected" }).debugInbound, "selected");
-	assert.equal(loadProxyConfig({ CODEX_MCP_DEBUG_INBOUND: "all" }).debugInbound, "all");
-	assert.equal(loadProxyConfig({ CODEX_MCP_DEBUG_INBOUND: "verbose" }).debugInbound, "verbose");
-	assert.equal(loadProxyConfig({ CODEX_MCP_DEBUG_INBOUND: "unknown" }).debugInbound, "unknown");
-	assert.equal(loadProxyConfig({ CODEX_MCP_DEBUG_INBOUND: "0" }).debugInbound, "off");
+	assert.equal(result.exitCode, 0);
+	assert.equal(result.stderr.includes("Failed to parse hook input JSON from stdin"), false);
+	assert.deepEqual(JSON.parse(result.stdout), {
+		permission: "allow",
+	});
+	assert.match(result.stderr, /Hook no longer injects cwd/);
 });
 
 void test("resolveSessionRoot prefers a Windows-accessible WSL sessions root for WSL launches", () => {
@@ -795,7 +938,7 @@ type ProxyHarness = {
 	child: ReturnType<typeof spawn>;
 	findCapturedRequest: (method: string, toolName: string) => Promise<JsonRpcRequest>;
 	findCapturedResponse: (id: JsonRpcId) => Promise<JsonRpcResponse>;
-	initialize: () => Promise<void>;
+	initialize: (overrides?: Record<string, unknown>) => Promise<void>;
 	notify: (method: string, params?: unknown) => Promise<void>;
 	readUntilNotification: (method: string) => Promise<JsonRpcNotification>;
 	readUntilRequest: (method: string) => Promise<JsonRpcRequest>;
@@ -954,7 +1097,7 @@ async function createProxyHarness(
 			assert.ok(match, `Expected captured response for id ${String(id)}`);
 			return match;
 		},
-		initialize: async () => {
+		initialize: async (overrides: Record<string, unknown> = {}) => {
 			let response: JsonRpcResponse;
 			try {
 				response = (
@@ -966,6 +1109,7 @@ async function createProxyHarness(
 						},
 						capabilities: {},
 						protocolVersion: "2025-03-26",
+						...overrides,
 					})
 				).response;
 			} catch (error) {
@@ -1114,4 +1258,36 @@ function formatHarnessDiagnostics(stderrText: string, childExitSummary: string |
 		childExitSummary ?? "proxy is still running",
 		stderrText ? `proxy stderr:\n${stderrText}` : "proxy stderr: <empty>",
 	].join("\n");
+}
+
+async function runScriptWithStdin(
+	scriptPath: string,
+	stdinText: string,
+): Promise<{
+	exitCode: number | null;
+	stderr: string;
+	stdout: string;
+}> {
+	const child = spawn(process.execPath, [scriptPath], {
+		stdio: ["pipe", "pipe", "pipe"],
+	});
+	children.push(child);
+
+	let stdout = "";
+	let stderr = "";
+	child.stdout.on("data", (chunk) => {
+		stdout += String(chunk);
+	});
+	child.stderr.on("data", (chunk) => {
+		stderr += String(chunk);
+	});
+
+	child.stdin.end(stdinText);
+
+	const [exitCode] = (await once(child, "exit")) as [number | null, NodeJS.Signals | null];
+	return {
+		exitCode,
+		stderr,
+		stdout: stdout.trim(),
+	};
 }
