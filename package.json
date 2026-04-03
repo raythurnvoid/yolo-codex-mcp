@@ -1,12 +1,12 @@
 {
-	"name": "yolo-codex-mcp",
+	"name": "yolo-opencode-mcp",
 	"version": "0.0.0",
-	"description": "Custom stdio MCP server that exposes the Smart Cheap Agent wrapper around Codex CLI tools for host-driven execution.",
+	"description": "Custom stdio MCP server that bridges OpenCode ACP into an MCP surface inspired by the ACP-MCP adapter.",
 	"keywords": [],
 	"license": "ISC",
 	"author": "",
 	"bin": {
-		"yolo-codex-mcp": "./dist/server.mjs"
+		"yolo-opencode-mcp": "./dist/server.mjs"
 	},
 	"type": "module",
 	"main": "dist/server.mjs",
@@ -19,9 +19,10 @@
 		"format:check": "node ./node_modules/prettier/bin/prettier.cjs --check .",
 		"check": "pnpm run format:check && vp check --no-fmt",
 		"check:fix": "pnpm run format && vp check --fix --no-fmt",
-		"test": "node --test --test-concurrency=1 tests/proxy.test.ts"
+		"test": "node --test --test-concurrency=1 tests/server.test.ts"
 	},
 	"dependencies": {
+		"@agentclientprotocol/sdk": "^0.17.1",
 		"@modelcontextprotocol/sdk": "^1.28.0",
 		"zod": "^4.3.6"
 	},

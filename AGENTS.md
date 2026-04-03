@@ -12,6 +12,15 @@ Use this file for repo-wide operating guidance. If a workflow is specialized or 
 - Generated output: `dist/`
 - Upstream reference material: `reference-submodules/`
 
+Reference codebases currently available under `reference-submodules/`:
+
+- `acp-mcp`: Python ACP-to-MCP adapter that bridges ACP agents into MCP as discoverable resources and invokable tools.
+- `acp-typescript-sdk`: Agent Client Protocol TypeScript SDK with generated schemas, Zod validators, connection primitives, and minimal agent/client examples.
+- `codex`: OpenAI Codex CLI codebase, including the local coding agent, TUI, MCP integrations, docs, and supporting Rust crates.
+- `modelcontextprotocol`: Canonical MCP specification repository containing the protocol spec, versioned schemas, and the source for the official documentation site.
+- `opencode`: Go-based terminal AI coding assistant with ACP support, TUI workflows, tool execution, LSP integration, and session storage.
+- `typescript-sdk`: Official Model Context Protocol TypeScript SDK monorepo with client/server packages, examples, middleware, and conformance/integration tests.
+
 Behavior summary:
 
 - The outer server is a stdio JSON-RPC proxy around the official inner Codex MCP server.
@@ -129,6 +138,20 @@ When changing server behavior:
 - add new logic next to the most similar existing logic instead of creating arbitrary new sections
 - preserve wire compatibility with the official inner server wherever possible, especially request ids, notifications, and server-initiated requests
 - do not add project-specific policy env vars; keep policy fixed in code unless the user explicitly asks to expand the config surface
+- treat the ACP SDK schema types as the canonical wire contract for the smart-agent runtime; do not maintain a second, hand-written subset of ACP event types in parallel
+- keep smart-agent cwd selection anchored to the location that triggered the MCP call; prefer tool-call or client workspace context over prompt-text heuristics
+- do not let incidental absolute paths embedded in prompts override a trustworthy triggering workspace cwd
+- for OpenCode ACP prompt turns, treat the `session/prompt` response and its `stopReason` as the primary completion boundary; do not infer turn completion from a pause in streamed output before that response arrives
+- ingest the full ACP `SessionUpdate` union internally, including user/assistant/thought chunks, tool-call lifecycle updates, plan updates, available-command updates, mode/config/session-info updates, and usage updates
+- keep a structured per-turn transcript/state in the runtime and derive final text, progress, heuristic checks, and debugging context from that transcript rather than from a flat text accumulator
+- keep grouped assistant/user/thought messages keyed by ACP `messageId` when present; preserve tool-call state keyed by `toolCallId` and merge later `tool_call_update` events into the same record
+- keep stderr as the canonical observability channel for ACP event flow; every ACP `SessionUpdate` should be logged in structured form with bounded previews rather than silent drops or unbounded dumps
+- any pre-response timeout in the smart-agent runtime must be a deadman for a wedged backend, reset by real ACP activity, not an “idle after output means done” shortcut
+- if an agent/backend turn ends on an interim progress reply while the model is clearly still locating, reading, checking, or otherwise continuing work, continue the same session instead of returning that intermediate message as final
+- keep interim text heuristics as a narrow fallback only for cases where OpenCode itself returns `end_turn` on a progress-style reply; do not use text heuristics as the primary completion signal when ACP has not yet finished the prompt turn
+- keep heuristic early-`end_turn` overrides explicitly logged with structured stderr context so we can measure whether the fallback is still needed and remove it once the backend is reliable enough
+- keep the outer MCP surface intentionally reduced and stable for ACP work in this repo unless the user explicitly asks to expose more ACP state through new MCP tools, prompts, or resources
+- keep regression coverage for both cwd-selection and interim-turn continuation behavior whenever you touch the smart-agent runtime or server flow
 
 When changing the outer tool surface:
 
