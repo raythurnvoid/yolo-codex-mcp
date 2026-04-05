@@ -4,3 +4,15 @@
 [submodule "reference-submodules/typescript-sdk"]
 	path = reference-submodules/typescript-sdk
 	url = https://github.com/modelcontextprotocol/typescript-sdk.git
+[submodule "reference-submodules/opencode"]
+	path = reference-submodules/opencode
+	url = https://github.com/opencode-ai/opencode.git
+[submodule "reference-submodules/acp-mcp"]
+	path = reference-submodules/acp-mcp
+	url = https://github.com/i-am-bee/acp-mcp.git
+[submodule "reference-submodules/acp-typescript-sdk"]
+	path = reference-submodules/acp-typescript-sdk
+	url = https://github.com/agentclientprotocol/typescript-sdk.git
+[submodule "reference-submodules/modelcontextprotocol"]
+	path = reference-submodules/modelcontextprotocol
+	url = https://github.com/modelcontextprotocol/modelcontextprotocol.git
